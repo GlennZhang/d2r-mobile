@@ -5542,7 +5542,9 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
 
     CAMetalLayer *layer = (__bridge CAMetalLayer *)front_metal_layer();
     if (!layer) return 0;
-    if (g_m4 && g_present_layer_resident != layer) { [g_q4 addResidencySet:layer.residencySet]; g_present_layer_resident = layer; }
+    if (g_present_layer_resident != layer) {   // drawable 纹理驻留在 layer 自己的驻留集里：挂了集合的队列按显式驻留走，两边队列都要挂（经典队列漏挂曾致 GPU Address Fault，见 MTL3 报告 P0 记录） | Drawable textures are resident in the layer's own residency set: a queue with sets attached follows explicit residency, so both queues need it (the missing attach on the classic queue caused GPU Address Faults, see the P0 notes in the MTL3 report)
+        if (g_m4) [g_q4 addResidencySet:layer.residencySet]; else [g_q addResidencySet:layer.residencySet];
+        g_present_layer_resident = layer; }
 #if TARGET_OS_OSX
     if (!layer.displaySyncEnabled) layer.displaySyncEnabled = YES;   // 窗口模式按显示器垂直同步，防撕裂 | Windowed mode follows the display's vsync to prevent tearing
 #endif
@@ -5558,14 +5560,20 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
         while (g_pq_done < g_present_alloc_fence[alloc_i]) pthread_cond_wait(&g_pq_cv, &g_pq_mu);
         pthread_mutex_unlock(&g_pq_mu);
     }
-    if (!g_m4) {   // P0 经典出图（二分）：只清 drawable、不碰游戏交换链纹理——先证明经典呈现机器本身可用；访问池内存纹理的问题留给 P1 | P0 classic present (bisect): clear the drawable only, never touching the game swapchain texture -- first prove the classic present machinery itself works; pool-memory texture access is P1's problem
+    if (!g_m4) {   // P1 二分 A：清游戏交换链纹理（写附件）、不清 drawable、不画 blit——分离「写 src」与「画管线」两个嫌疑 | P1 bisect A: clear the game swapchain texture (attachment write) only -- separates the suspects "write src" vs "draw the pipeline"
         id<MTLCommandBuffer> ccb = [g_q commandBuffer];
         MTLRenderPassDescriptor *cp = [MTLRenderPassDescriptor renderPassDescriptor];
-        cp.colorAttachments[0].texture = dr.texture;
+        cp.colorAttachments[0].texture = src;
         cp.colorAttachments[0].loadAction = MTLLoadActionClear;
         cp.colorAttachments[0].clearColor = MTLClearColorMake(0.10, 0.18, 0.38, 1.0);
         cp.colorAttachments[0].storeAction = MTLStoreActionStore;
         id<MTLRenderCommandEncoder> cen = [ccb renderCommandEncoderWithDescriptor:cp]; [cen endEncoding];
+        MTLRenderPassDescriptor *dp2 = [MTLRenderPassDescriptor renderPassDescriptor];
+        dp2.colorAttachments[0].texture = dr.texture;
+        dp2.colorAttachments[0].loadAction = MTLLoadActionClear;
+        dp2.colorAttachments[0].clearColor = MTLClearColorMake(0.10, 0.18, 0.38, 1.0);
+        dp2.colorAttachments[0].storeAction = MTLStoreActionStore;
+        id<MTLRenderCommandEncoder> den2 = [ccb renderCommandEncoderWithDescriptor:dp2]; [den2 endEncoding];
         uint64_t tick = ticket;
         [ccb addCompletedHandler:^(id<MTLCommandBuffer> c) {
             if (c.error) MLOG("【红】上屏命令缓冲错误：%s", c.error.description.UTF8String);
