@@ -50,6 +50,7 @@ static id<MTLDevice> g_dev;
 static NSMutableArray *g_l3_gpu_leaks;
 static int g_nvn_deswz_gpu;
 static id<MTLCommandQueue> g_q;
+int g_m4 = 1;   // 设备支持 Metal 4（MTL4 队列可建）：A13 等老 GPU 为 0，走经典回退（mtl_init 探测；P0 阶段回退=跳过重放、经典队列清屏出图） | Device supports Metal 4 (MTL4 queue creatable): 0 on older GPUs such as A13, taking the classic fallback (probed in mtl_init; at P0 the fallback = skip replay, classic-queue clear-color present)
 static id<MTL4CommandQueue> g_q4;
 static dispatch_queue_t g_feedback_q;
 static _Atomic uint32_t g_present_qos;
@@ -262,11 +263,16 @@ void mtl_init(void) {
     if (!g_res) MDIE("建立 MTLResidencySet 失败");
     [g_q addResidencySet:g_res];
     { void crash_set_wait_dump(void (*fn)(void)); void mtl_wait_state_dump(void); crash_set_wait_dump(mtl_wait_state_dump); }
+    // 探测 Metal 4：真调用一次队列创建来判（A13 实测 respondsToSelector: 返回 YES 但方法是抛 doesNotRecognizeSelector: 的桩，问不出来，只能试）
+    // Probe for Metal 4: judge by actually calling queue creation once (on A13, measured: respondsToSelector: returns YES but the method is a stub that throws doesNotRecognizeSelector:, so asking does not work; trying does)
     dispatch_queue_attr_t feedback_attr = dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0);
     g_feedback_q = dispatch_queue_create("dm.nvn.mtl4-feedback", feedback_attr);
     MTL4CommandQueueDescriptor *q4d = [MTL4CommandQueueDescriptor new]; q4d.feedbackQueue = g_feedback_q;
-    g_q4 = [g_dev newMTL4CommandQueueWithDescriptor:q4d error:&re];
-    if (!g_q4) MDIE("建立 MTL4CommandQueue 失败");
+    @try { g_q4 = [g_dev newMTL4CommandQueueWithDescriptor:q4d error:&re]; }
+    @catch (NSException *e) { g_q4 = nil; MLOG("[P0] newMTL4CommandQueueWithDescriptor 抛异常：%s", e.reason.UTF8String); }
+    g_m4 = g_q4 != nil;
+    if (!g_m4) MLOG("[P0] GPU 无 Metal 4（%s）：MTL4 队列/分配器/参数表未建，走经典队列回退（跳过重放，清屏出图）", g_dev.name.UTF8String);
+    if (g_m4) {
     [g_q4 addResidencySet:g_res];
     g_alloc_n = 3;
     for (int i = 0; i < 3; i++) {
@@ -297,6 +303,7 @@ void mtl_init(void) {
     if (!g_present_args) MDIE("建立出图 argument table 失败：%s", ate.localizedDescription.UTF8String);
     g_bloomq_args = [g_dev newArgumentTableWithDescriptor:pad error:&ate];
     if (!g_bloomq_args) MDIE("建立泛光 1/4 argument table 失败：%s", ate.localizedDescription.UTF8String);
+    } else MLOG("[P0] GPU 无 Metal 4（%s）：MTL4 队列/分配器/参数表未建，走经典队列回退（跳过重放，清屏出图）", g_dev.name.UTF8String);
     for (int i = 0; i < 3; i++) {
         g_present_uv[i] = [g_dev newBufferWithLength:sizeof(float) * 8 options:MTLResourceStorageModeShared];
         if (!g_present_uv[i]) MDIE("建立出图 UV 缓冲[%d] 失败", i);
@@ -462,7 +469,8 @@ void mtl_sub_begin(void) {
     g_sub_thread = pthread_self(); atomic_store(&g_sub_thread_set, 1);
     atomic_store(&g_last_commit_error, 0);
     g_sub_pool = objc_autoreleasePoolPush();
-    g_cb = [g_dev newCommandBuffer];
+    g_cb = g_m4 ? [g_dev newCommandBuffer] : [g_q commandBuffer];   // 设备级 newCommandBuffer 是 MTL4 用法；经典从队列建（持引用版：经典路径的对象生命周期未按无引用方式管理） | Device-level newCommandBuffer is an MTL4 idiom; classic creates from the queue (retaining variant: object lifetimes on the classic path are not managed for unretained references)
+    if (g_m4) {
     // 不在帧中间等 GPU（真机热态：固定 3 个轮转时 GPU 跟不上就每帧在这里阻塞，提交线程睡醒后按低频跑，指令数 −18% 而 CPU 时间 +49%）：
     // 挑一个 GPU 已用完的分配器；都在用就新建；到上限才等最老的那个。超前量由游戏取交换链贴图处的等待约束，与旧接口相同。
     // Do not wait for the GPU mid-frame (hot real device: with a fixed rotation of 3, when the GPU cannot keep up every frame blocks here, and the submit thread runs at low frequency after waking, instruction count −18% but CPU time +49%):
@@ -476,6 +484,7 @@ void mtl_sub_begin(void) {
     g_alloc_cur = alloc_i;
     [g_alloc4[alloc_i] reset];
     [g_cb beginCommandBufferWithAllocator:g_alloc4[alloc_i]];
+    }   // !g_m4：经典命令缓冲不挑分配器（newCommandBuffer 已隐式分配） | !g_m4: a classic command buffer picks no allocator (newCommandBuffer has implicitly allocated)
     g_commit_blocks = [NSMutableArray array];
     g_npost = 0; g_vis = nil; g_vis_n = 0; g_vis_cur = -1; g_npend = 0; g_pend_over = 0;
     zskip_clear(); g_zskip_count = 0;
@@ -684,13 +693,12 @@ uint64_t mtl_sub_commit(void) {
     int n = g_npost; post_op *ops = n ? malloc(n * sizeof *ops) : NULL;
     if (n) memcpy(ops, g_post, n * sizeof *ops);
     NSArray<dispatch_block_t> *commit_blocks = [g_commit_blocks copy];
-    MTL4CommitOptions *o = [MTL4CommitOptions new];
-    [o addFeedbackHandler:^(id<MTL4CommitFeedback> f) { (void)f; for (dispatch_block_t block in commit_blocks) block(); }];
     uint64_t gpu_f = atomic_load(&g_cur_frame); gpu_tag_begin(gpu_f);
     NSString *cctx = @(cctx_snap());
-    [o addFeedbackHandler:^(id<MTL4CommitFeedback> cb) {
-        gpu_tag_done(gpu_f, cb.GPUStartTime, cb.GPUEndTime);
-        if (cb.error) { atomic_store(&g_last_commit_error, 1); static int n, nv; int victim = [cb.error.description containsString:@"InnocentVictim"]; if (victim ? nv++ < 1 : n++ < 8) MLOG("【红】命令缓冲错误详情 fence=%llu：%s | GPU %.3f→%.3f", (unsigned long long)fence, cb.error.description.UTF8String, cb.GPUStartTime, cb.GPUEndTime); if (!victim) MLOG("【红】出错那次提交的现场 fence=%llu：%s", (unsigned long long)fence, cctx.UTF8String); MLOG("【红】命令缓冲执行出错：%s", cb.error.localizedDescription.UTF8String); }
+    // 完成回调主体：MTL4 走 feedback handler、经典走 addCompletedHandler，同一份逻辑 | Completion body: MTL4 via feedback handler, classic via addCompletedHandler, same logic
+    void (^on_done)(NSError *, double, double) = ^(NSError *err, double g0, double g1) {
+        gpu_tag_done(gpu_f, g0, g1);
+        if (err) { atomic_store(&g_last_commit_error, 1); static int n, nv; int victim = [err.description containsString:@"InnocentVictim"]; if (victim ? nv++ < 1 : n++ < 8) MLOG("【红】命令缓冲错误详情 fence=%llu：%s | GPU %.3f→%.3f", (unsigned long long)fence, err.description.UTF8String, g0, g1); if (!victim) MLOG("【红】出错那次提交的现场 fence=%llu：%s", (unsigned long long)fence, cctx.UTF8String); MLOG("【红】命令缓冲执行出错：%s", err.localizedDescription.UTF8String); }
         for (int i = 0; i < n; i++) {
             if (ops[i].kind == 1) { if (ops[i].mode == 1) *ops[i].val += ops[i].v; else *ops[i].val = ops[i].v; }
             else if (ops[i].kind == 3) {   // 通过采样数：自清零以来各槽之和 | Samples passed: the sum of all slots since the reset
@@ -703,14 +711,23 @@ uint64_t mtl_sub_commit(void) {
         free(ops);
         pthread_mutex_lock(&g_mu); if (fence > g_done) g_done = fence; pthread_cond_broadcast(&g_cv); pthread_mutex_unlock(&g_mu);
         defer_drain();
-    }];
+    };
     void arena_commit(uint64_t fence); arena_commit(fence);
     res_commit();
-    [g_cb endCommandBuffer];
-    id<MTL4CommandBuffer> buffers[] = {g_cb};
-    [g_q4 commit:buffers count:1 options:o];
-    [g_q4 signalEvent:g_ev value:fence];
-    g_alloc_fence[g_alloc_cur] = fence;
+    if (g_m4) {
+        [g_cb endCommandBuffer];
+        MTL4CommitOptions *o = [MTL4CommitOptions new];
+        [o addFeedbackHandler:^(id<MTL4CommitFeedback> f) { (void)f; for (dispatch_block_t block in commit_blocks) block(); }];
+        [o addFeedbackHandler:^(id<MTL4CommitFeedback> cb) { on_done(cb.error, cb.GPUStartTime, cb.GPUEndTime); }];
+        id<MTL4CommandBuffer> buffers[] = {g_cb};
+        [g_q4 commit:buffers count:1 options:o];
+        [g_q4 signalEvent:g_ev value:fence];
+        g_alloc_fence[g_alloc_cur] = fence;
+    } else {   // P0 经典回退：空命令缓冲直接提交；完成回调等价（无 MTL4 分配器围栏可记） | P0 classic fallback: submit the (empty) command buffer directly; the completion callback is equivalent (no MTL4 allocator fence to record)
+        for (dispatch_block_t block in commit_blocks) block();
+        [(id<MTLCommandBuffer>)g_cb addCompletedHandler:^(id<MTLCommandBuffer> c) { on_done(c.error, c.GPUStartTime, c.GPUEndTime); }];
+        [(id<MTLCommandBuffer>)g_cb commit];
+    }
     g_cb = nil;
     g_commit_blocks = nil;
     objc_autoreleasePoolPop(g_sub_pool); g_sub_pool = NULL;
@@ -937,6 +954,7 @@ static int up_lost_take(id tex) {   // 这张贴图的上传被丢过：从记�
 }
 static void up_diag(void);
 static void up_flush(void) {
+    if (!g_m4) return;   // P0 经典回退：上传批不建（g_up_cb 恒 nil，本函数本就直返；显式挡住更清晰） | P0 classic fallback: no upload batch is created (g_up_cb stays nil so this would return anyway; the explicit guard is clearer)
     up_owner_check("up_flush");
     if (!g_up_cb) return;
     if (g_up_ce) {
@@ -986,6 +1004,7 @@ static void up_flush(void) {
 }
 
 static void up_begin(void) {
+    if (!g_m4) return;   // P0 经典回退：不上传贴图数据（pkg_upload_ 已挡，双保险） | P0 classic fallback: no texture data upload (pkg_upload_ already gates; belt and braces)
     up_owner_check("up_begin");
     if (g_up_cb) return;
     unsigned slot = g_up_seq++ % 3;
@@ -1076,6 +1095,7 @@ void mtl_create_stats(uint64_t *lib, uint64_t *pso) { *lib = g_bp_lib_n; *pso = 
 void mtl_create_ns(uint64_t *lib_ns, uint64_t *pso_ns) { *lib_ns = g_bp_lib_ns; *pso_ns = g_bp_pso_ns; }   // 同步现建着色器库 / 管线的累计耗时（长帧日志按帧取差） | Cumulative time spent synchronously creating shader libraries / pipelines on the spot (the long-frame log takes the per-frame difference)
 uint64_t mtl_upload_bytes(void) { return g_bp_up_bytes; }   // 贴图上传累计字节 | Cumulative texture upload bytes
 static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp) {
+    if (!g_m4) return nil;   // P0 经典回退：贴图数据不上传（出图走清屏，不需要内容） | P0 classic fallback: texture data is not uploaded (present uses the clear color; no content needed)
     MTLTextureDescriptor *d = tex_desc(t, 1);
     if (!d) return nil;
     id<MTLTexture> mt = [g_dev newTextureWithDescriptor:d];
@@ -5006,6 +5026,7 @@ static int frz_op(unsigned op, const void *a) {   // 返回 1 = 这条操作不�
 
 void mtl_exec(const uint8_t *p) {
     static int inited; if (!inited) { inited = 1; state_reset(); }
+    if (!g_m4) { static int once; if (!once) { once = 1; MLOG("[P0] 经典后端：跳过命令重放（本阶段只验证经典队列初始化与出图）"); } (void)p; return; }   // P0：MTL4 编码路径整体不可用 | P0: the MTL4 encoding paths are unavailable as a whole
     static int dump_all = -1; if (dump_all < 0) dump_all = getenv("DM_NVN_PASSDUMP_ALL") != NULL;
     int trace = dump_all && passdump();   // 普通模式不逐操作查帧范围，完整命令位置仅用于指定诊断帧 | Normal mode does not check the frame range per operation; the full command position is only used for the designated diagnostic frames
     for (;;) {
@@ -5521,7 +5542,7 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
 
     CAMetalLayer *layer = (__bridge CAMetalLayer *)front_metal_layer();
     if (!layer) return 0;
-    if (g_present_layer_resident != layer) { [g_q4 addResidencySet:layer.residencySet]; g_present_layer_resident = layer; }
+    if (g_m4 && g_present_layer_resident != layer) { [g_q4 addResidencySet:layer.residencySet]; g_present_layer_resident = layer; }
 #if TARGET_OS_OSX
     if (!layer.displaySyncEnabled) layer.displaySyncEnabled = YES;   // 窗口模式按显示器垂直同步，防撕裂 | Windowed mode follows the display's vsync to prevent tearing
 #endif
@@ -5537,6 +5558,23 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
         while (g_pq_done < g_present_alloc_fence[alloc_i]) pthread_cond_wait(&g_pq_cv, &g_pq_mu);
         pthread_mutex_unlock(&g_pq_mu);
     }
+    if (!g_m4) {   // P0 经典出图（二分）：只清 drawable、不碰游戏交换链纹理——先证明经典呈现机器本身可用；访问池内存纹理的问题留给 P1 | P0 classic present (bisect): clear the drawable only, never touching the game swapchain texture -- first prove the classic present machinery itself works; pool-memory texture access is P1's problem
+        id<MTLCommandBuffer> ccb = [g_q commandBuffer];
+        MTLRenderPassDescriptor *cp = [MTLRenderPassDescriptor renderPassDescriptor];
+        cp.colorAttachments[0].texture = dr.texture;
+        cp.colorAttachments[0].loadAction = MTLLoadActionClear;
+        cp.colorAttachments[0].clearColor = MTLClearColorMake(0.10, 0.18, 0.38, 1.0);
+        cp.colorAttachments[0].storeAction = MTLStoreActionStore;
+        id<MTLRenderCommandEncoder> cen = [ccb renderCommandEncoderWithDescriptor:cp]; [cen endEncoding];
+        uint64_t tick = ticket;
+        [ccb addCompletedHandler:^(id<MTLCommandBuffer> c) {
+            if (c.error) MLOG("【红】上屏命令缓冲错误：%s", c.error.description.UTF8String);
+            pthread_mutex_lock(&g_pq_mu); if (tick > g_pq_done) g_pq_done = tick; g_pq_inflight--; pthread_cond_broadcast(&g_pq_cv); pthread_mutex_unlock(&g_pq_mu);
+        }];
+        pthread_mutex_lock(&g_pq_mu); g_pq_inflight++; pthread_mutex_unlock(&g_pq_mu);
+        [ccb commit];
+    }
+    if (g_m4) {
     [g_present_alloc4[alloc_i] reset];
     [g_q4 waitForDrawable:dr];
     id<MTL4CommandBuffer> cb = g_present_cb[alloc_i];
@@ -5551,6 +5589,7 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
     id<MTL4CommandBuffer> buffers[] = {cb};
     pthread_mutex_lock(&g_pq_mu); g_pq_inflight++; pthread_mutex_unlock(&g_pq_mu);
     [g_q4 commit:buffers count:1 options:o];
+    }   // g_m4
     if (target_ts > 0) {
         static double leads[300], e2e[300];   // e2e：游戏入队 → 系统预定上屏（含在队列里等节拍回调的时间），输入延迟里我们这一侧能读到的全程 | e2e: game enqueue -> system-scheduled present (including the time waiting in the queue for the display-link callback), the full span of input latency that our side can read
         static uint64_t lead_n;
@@ -5566,7 +5605,7 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
                  (unsigned long long)g_link_dropped, a[149], a[0], b[149], b[0], b[299]);
         }
     }
-    [g_q4 signalDrawable:dr];
+    if (g_m4) [g_q4 signalDrawable:dr];
     g_present_alloc_fence[alloc_i] = ticket;
 #if TARGET_OS_SIMULATOR   // iOS 模拟器 SDK 没有呈现时刻回调与最短显示时长（只作画面验收用，不计节拍） | The iOS simulator SDK has no presentation-time callback and no minimum display duration (used only for picture acceptance, display-link ticks are not counted)
     (void)period; [dr present];
