@@ -3,3 +3,13 @@
 .iosdd_mac/
 .iosdd_*/
 .DS_Store
+
+# Local game files, keys and generated signing configuration are not source.
+/games/
+/dm/ios/project_free.yml
+*.p12
+*.pfx
+*.mobileprovision
+prod.keys
+title.keys
+titlekeys.txt

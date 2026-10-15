@@ -191,15 +191,18 @@ flowchart LR
 
 ## 支持哪些设备
 
-最低要求：**A14 / M1 及以后的芯片**——本项目的图形层要用 Metal 3，苹果从 A14 / M1 起才支持（依据：苹果的[Metal 支持的设备](https://support.apple.com/102894)、[Metal 功能表](https://developer.apple.com/metal/Metal-Feature-Set-Tables.pdf)）。
+**本分支说明：** `mtl3-fallback` 增加了 iPhone 11（A13，4 GB，iOS 26.3）的实验性支持，仍有 GPU 超时、发热与高内存问题；不适用上文的稳定性和 60 帧描述。实现、构建及测试范围见 [iPhone 11 实验性支持](docs/IPHONE11.zh-CN.md)。下列常规要求沿用上游说明。
+
+上游主分支最低要求：**A14 / M1 及以后的芯片**——本项目的图形层要用 Metal 3，苹果从 A14 / M1 起才支持（依据：苹果的[Metal 支持的设备](https://support.apple.com/102894)、[Metal 功能表](https://developer.apple.com/metal/Metal-Feature-Set-Tables.pdf)）。
 
 | 设备 | 能不能玩 | 怎么做 | 把握程度 |
 |---|---|---|---|
 | **iPhone / iPad，A17 Pro 及以后**（iPhone 15 Pro 起、iPhone 16 起、M 系列芯片的 iPad） | 直接玩 | iOS 26 及以上用缺省的壳 / 缺省构建；iOS 18 – 25 用 iOS 18 的壳 / [老接口版](docs/OLDER_SYSTEMS.zh-CN.md) | 主力机型，日常在玩 |
 | **iPhone / iPad，A16 及更早**（iPhone 14 全系、iPhone 15 / 15 Plus、iPhone 13 系列等） | 可以玩，多一步 | 按 [docs/LEGACY_DEVICES.zh-CN.md](docs/LEGACY_DEVICES.zh-CN.md) 用自己的游戏文件做一份老机型补充包，做安装包时带上它；系统同上一行分 iOS 26 / iOS 18 – 25 | 已有玩家实测：iPhone 14 Pro Max（A16，6 GB）60 帧；iPhone 13 Pro Max（A15，6 GB）30 帧档 |
-| **4 GB 内存的设备**（如 iPad Air 第 4 代） | 暂不支持（在优化内存，有进展更新） | — | 已有玩家实测：iPad Air 4（A14，4 GB）带上老机型补充包后，启动几秒即因整机内存不足被系统结束 |
+| **iPhone 11（A13，4 GB），仅本分支** | 实验性可玩 | 本分支 iOS 26 构建 + 老机型补充包，自动启用低内存模式；见[说明](docs/IPHONE11.zh-CN.md) | iOS 26.3 已实测短时游玩；长期稳定性未验证，仍有 GPU 超时 |
+| **其他 4 GB 内存的设备**（如 iPad Air 第 4 代） | 暂不支持（在优化内存，有进展更新） | — | 已有玩家实测：iPad Air 4（A14，4 GB）带上老机型补充包后，启动几秒即因整机内存不足被系统结束 |
 | **A14 芯片、6 GB 及以上内存**（如 iPhone 12 Pro / 12 Pro Max） | 尚无报告 | 同 A16 及更早那一行 | 欢迎试过的人开 Issue 告诉我们结果 |
-| **A13 及更早的芯片**（如 iPhone 11 系列、2020 年的 iPad Pro） | 不支持 | — | 图形芯片不支持 Metal 3（玩家在 iPad Pro A12Z 上实测；苹果依据见表上方）；App 启动时会直接提示，不会闪退 |
+| **其他 A13 及更早的设备**（如未测试的 iPhone 11 系列机型、2020 年的 iPad Pro） | 本分支未验证，上游不支持 | — | 上游图形芯片要求为 Metal 3（玩家在 iPad Pro A12Z 上实测；苹果依据见表上方）；App 启动时会直接提示，不会闪退 |
 | **Mac，Apple 芯片** | 直接玩（原生 macOS App） | macOS 26 及以上用缺省出法；macOS 15 – 25 用[老接口出法](docs/OLDER_SYSTEMS.zh-CN.md)。键盘、鼠标、手柄都能玩，各自能做什么见 [docs/MAC.zh-CN.md](docs/MAC.zh-CN.md) | 已有玩家在 macOS 15.7.7 上实际玩过老接口版 |
 | **Apple TV 4K（第三代 A15）** | 社区移植（[@yinqingyan](https://github.com/yinqingyan)，经作者同意按 MIT 许可贡献），开发者预览 | 照 [dm/tvos/README.md](dm/tvos/README.md) 构建并把游戏文件、老机型补充包拷进 App；只能在实机上跑，模拟器跑不了；存档放在系统可清理的 Caches 目录里 | 已在实机上到达职业选择画面；进游戏、手柄全键位、存档尚未验证，维护者没有实机测试过 |
 | **Intel 芯片的 Mac** | 不支持 | — | — |
