@@ -114,6 +114,7 @@ static void restart_cover_hook(int on) { dispatch_async(dispatch_get_main_queue(
 - (void)touchesCancelled:(NSSet<UITouch *> *)t withEvent:(UIEvent *)e {}
 @end
 @implementation DmMetalView {
+    UIButton *_characterCreate, *_characterStandard, *_characterHardcore, *_characterPlay;
     UITouch *_slot[16];   // 强引用（真机 SIGSEGV：原先不保留，某条路径没清槽时手指对象已释放，下次 pushFrom 读它就崩）。所有结束 / 取消路径都要清槽 | Strong references (real-device SIGSEGV: previously not retained, so when some path failed to clear the slot the finger object was already released and the next pushFrom crashed reading it). All end / cancel paths must clear the slot
     dm_tc_state _controls;
     DmTouchOverlay *_overlay;
@@ -140,13 +141,79 @@ static void restart_cover_hook(int on) { dispatch_async(dispatch_get_main_queue(
     _rsCover=[[DmSwallowView alloc] initWithFrame:self.bounds]; _rsCover.backgroundColor=UIColor.blackColor; _rsCover.hidden=YES; _rsCover.userInteractionEnabled=YES;   // 开的时候挂到窗口上（restartCover） | Attached to the window when turned on (restartCover)
     { extern void (*g_dm_restart_cover_hook)(int); g_dm_restart_cover_hook=restart_cover_hook; }
     _navigation=0; [self navigationMode:atomic_load(&g_touch_navigation)];
+    if (getenv("DM_LOW_MEMORY") && atoi(getenv("DM_LOW_MEMORY"))) {
+        _characterCreate = [UIButton buttonWithType:UIButtonTypeSystem];
+        _characterCreate.hidden = YES;
+        _characterCreate.accessibilityIdentifier = @"dm_character_create";
+        _characterCreate.titleLabel.font = [UIFont boldSystemFontOfSize:18];
+        [_characterCreate setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+        _characterCreate.backgroundColor = [UIColor colorWithRed:0.28 green:0.20 blue:0.12 alpha:0.95];
+        _characterCreate.layer.cornerRadius = 6;
+        [_characterCreate addTarget:self action:@selector(createCharacterNext) forControlEvents:UIControlEventTouchUpInside];
+        [self addSubview:_characterCreate];
+        _characterStandard = [UIButton buttonWithType:UIButtonTypeSystem];
+        _characterHardcore = [UIButton buttonWithType:UIButtonTypeSystem];
+        for (UIButton *button in @[_characterStandard, _characterHardcore]) {
+            button.hidden = YES; button.titleLabel.font = _characterCreate.titleLabel.font;
+            [button setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+            button.backgroundColor = _characterCreate.backgroundColor; button.layer.cornerRadius = 6;
+            [self addSubview:button];
+        }
+        _characterStandard.accessibilityIdentifier = @"dm_character_standard";
+        _characterHardcore.accessibilityIdentifier = @"dm_character_hardcore";
+        [_characterStandard addTarget:self action:@selector(chooseStandard) forControlEvents:UIControlEventTouchUpInside];
+        [_characterHardcore addTarget:self action:@selector(chooseHardcore) forControlEvents:UIControlEventTouchUpInside];
+
+        _characterPlay = [UIButton buttonWithType:UIButtonTypeSystem];
+        _characterPlay.hidden = YES;
+        _characterPlay.accessibilityIdentifier = @"dm_character_play";
+        _characterPlay.titleLabel.font = _characterCreate.titleLabel.font;
+        [_characterPlay setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+        _characterPlay.backgroundColor = _characterCreate.backgroundColor;
+        _characterPlay.layer.cornerRadius = 6;
+        [_characterPlay addTarget:self action:@selector(playCharacter) forControlEvents:UIControlEventTouchUpInside];
+        [self addSubview:_characterPlay];
+        __weak DmMetalView *weakView = self;
+        [NSTimer scheduledTimerWithTimeInterval:0.1 repeats:YES block:^(NSTimer *timer) {
+            DmMetalView *view = weakView; if (!view) { [timer invalidate]; return; }
+            extern int dm_ui_character_play_available(void);
+            view->_characterPlay.hidden = !dm_ui_character_play_available();
+            [view->_characterPlay setTitle:dm_lang_zh() ? @"开始游戏" : @"Play" forState:UIControlStateNormal];
+            [view bringSubviewToFront:view->_characterPlay];
+            extern int dm_ui_character_create_open(void);
+            view->_characterCreate.hidden = !dm_ui_character_create_open();
+            [view->_characterCreate setTitle:dm_lang_zh() ? @"创建" : @"Create" forState:UIControlStateNormal];
+            [view bringSubviewToFront:view->_characterCreate];
+            extern int dm_ui_character_options_open(void);
+            BOOL options = dm_ui_character_options_open();
+            view->_characterStandard.hidden = view->_characterHardcore.hidden = !options;
+            [view->_characterStandard setTitle:dm_lang_zh() ? @"标准" : @"Standard" forState:UIControlStateNormal];
+            [view->_characterHardcore setTitle:dm_lang_zh() ? @"专家" : @"Hardcore" forState:UIControlStateNormal];
+            [view bringSubviewToFront:view->_characterStandard]; [view bringSubviewToFront:view->_characterHardcore];
+
+        }];
+    }
     return self;
 }
 - (void)safeAreaInsetsDidChange { [super safeAreaInsetsDidChange]; [self setNeedsLayout]; }
+- (void)playCharacter { extern void dm_ui_character_play(void); dm_ui_character_play(); }
+- (void)chooseStandard { extern void dm_ui_character_option_choose(int); dm_ui_character_option_choose(0); }
+- (void)chooseHardcore { extern void dm_ui_character_option_choose(int); dm_ui_character_option_choose(1); }
+- (void)createCharacterNext {
+    extern void dm_ui_send_queue(const char *);
+    dm_ui_send_queue("ConsoleCharacterCreate:ToConsoleCharacterOptions");
+}
 - (void)layoutSubviews {
     [super layoutSubviews];
+    if (_characterCreate) _characterCreate.frame = CGRectMake((self.bounds.size.width - 160) / 2,
+        fmax(0, self.bounds.size.height - self.safeAreaInsets.bottom - 52), 160, 44);
+
     CAMetalLayer *l=(CAMetalLayer *)self.layer;
     if(l==g_layer) l.drawableSize=CGSizeMake(self.bounds.size.width*l.contentsScale,self.bounds.size.height*l.contentsScale);   // 真全屏（iPad）时出图层挂在外层容器上，不是这一层 | In true fullscreen (iPad) the present layer hangs on the outer container, not this layer
+    CGFloat choiceY = fmax(0, self.bounds.size.height - self.safeAreaInsets.bottom - 52);
+    _characterPlay.frame = CGRectMake((self.bounds.size.width - 160) / 2, choiceY, 160, 44);
+    _characterStandard.frame = CGRectMake(self.bounds.size.width / 2 - 168, choiceY, 160, 44);
+    _characterHardcore.frame = CGRectMake(self.bounds.size.width / 2 + 8, choiceY, 160, 44);
     UIEdgeInsets si=self.safeAreaInsets; static CGFloat sl=-1,sr=-1; BOOL safeChanged=(si.left!=sl || si.right!=sr);   // 安全区变了（首次布局 / 转屏）也要重排控件 | A safe area change (first layout / rotation) also requires re-laying out the widgets
     if (safeChanged) { sl=si.left; sr=si.right; dm_tc_set_safe_insets((float)si.left,(float)si.right); }
     // 只对 iPad：底部安全区那一条不起摇杆（见 dm_tc_set_edge_bottom）。视图不贴屏幕底（留边档）时这个值自然是 0。DM_TEST_EDGE_B：Mac 上没有底部安全区，测试用
@@ -962,6 +1029,14 @@ uint64_t front_game_res(int docked) {
             // DM_IPAD_FULL=0 falls back to the above: 16:9 with black bars throughout
             if (aspect < 16.0 / 9 - 0.01) { const char *fu = getenv("DM_IPAD_FULL");
                 if (!fu || atoi(fu)) { g_full = 1; dm_uiscreen_enable(DM_UISCREEN_BOTTOM); } else { aspect = 16.0 / 9; fh = (unsigned)llround(fw * 9.0 / 16 / 2) * 2; } } }
+    }
+    static int low_applied;
+    if (!low_applied) {
+        low_applied = 1;
+        const char *low = getenv("DM_LOW_MEMORY");
+        if (!getenv("DM_GAME_RES") && low && atoi(low) && fw > 1280) {
+            fw = 1280; fh = (unsigned)llround(fw / aspect / 2) * 2;
+        }
     }
     if (fw && docked) return (uint64_t)fh << 32 | fw;
     uint64_t h = docked ? 900 : 720, w = (uint64_t)llround(h * aspect / 8) * 8;

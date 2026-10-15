@@ -51,6 +51,26 @@ static NSMutableArray *g_l3_gpu_leaks;
 static int g_nvn_deswz_gpu;
 static id<MTLCommandQueue> g_q;
 int g_m4 = 1;   // 设备支持 Metal 4（MTL4 队列可建）：A13 等老 GPU 为 0，走经典回退（mtl_init 探测；P0 阶段回退=跳过重放、经典队列清屏出图） | Device supports Metal 4 (MTL4 queue creatable): 0 on older GPUs such as A13, taking the classic fallback (probed in mtl_init; at P0 the fallback = skip replay, classic-queue clear-color present)
+
+// ---- 远程调试闸门：Documents/dm_gate.txt 里的数字（缺省 3），按提交轮询 mtime，改文件即时生效 ----
+// 0 = 不重放（P0 行为）  1 = 重放但不做参数绑定  2 = 重放+绑定但不发绘制/派发  3 = 全量。用于在真机上二分定位 GPU 故障层
+// ---- Remote debug gate: the number in Documents/dm_gate.txt (default 3); mtime is polled per submission so file changes take effect immediately ----
+// 0 = no replay (P0 behavior)  1 = replay but no argument binding  2 = replay + binding but no draws / dispatches  3 = full. For bisecting the GPU-fault layer on a real device
+int g_dm_gate = 3;
+static void gate_poll(void) {
+#if TARGET_OS_IPHONE
+    static struct timespec mt = {-1, -1}; static char path[1024];
+    if (!path[0]) { extern char g_log_path[1024]; snprintf(path, sizeof path, "%s", g_log_path); char *s = strrchr(path, '/'); if (s) snprintf(s + 1, sizeof path - (size_t)(s + 1 - path), "dm_gate.txt"); else path[0] = 0; }
+    if (!path[0]) return;
+    struct stat st;
+    if (stat(path, &st) || (st.st_mtimespec.tv_sec == mt.tv_sec && st.st_mtimespec.tv_nsec == mt.tv_nsec)) return;
+    mt = st.st_mtimespec;
+    FILE *f = fopen(path, "r"); int v = 3;
+    if (f) { if (fscanf(f, "%d", &v) != 1) v = 3; fclose(f); }
+    if (v < 0 || v > 3) v = 3;
+    if (v != g_dm_gate) { g_dm_gate = v; MLOG("[gate] dm_gate.txt → %d（0 不重放 / 1 无绑定 / 2 无绘制 / 3 全量）", v); }
+#endif
+}
 static id<MTL4CommandQueue> g_q4;
 static dispatch_queue_t g_feedback_q;
 static _Atomic uint32_t g_present_qos;
@@ -201,9 +221,36 @@ void bf_want_note(const char *key) {
 
 // ---------- 内存池 ----------
 // ---------- Memory pools ----------
-typedef struct { uintptr_t lo, hi; uintptr_t base; __unsafe_unretained id<MTLBuffer> buf; uint64_t gpu; const void *key; } pool_ent;
+typedef struct { uintptr_t lo, hi; uintptr_t base; __unsafe_unretained id<MTLBuffer> buf; uint64_t gpu; const void *key; int resident; } pool_ent;
 static pool_ent *g_pools; static int g_npool, g_cap;
 static NSMutableArray *g_keep;                  // 持有缓冲引用（pool_ent 里是不持有的指针） | Holds the buffer references (pool_ent has non-owning pointers)
+@interface NvPoolRange : NSObject { @public const void *key; uintptr_t lo, hi; id<MTLBuffer> buf; } @end
+@implementation NvPoolRange @end
+static NSMutableArray<NvPoolRange *> *g_pool_ranges;
+// Test-only experiment: game shaders also carry raw pool addresses; keep full linear mappings in production.
+static int g_classic_pool_ranges;
+// Called under g_mu. Classic shaders bind objects, so only map the ranges they access.
+static id<MTLBuffer> pool_buffer(pool_ent *p, uint64_t addr, uint64_t len, uint64_t *off) {
+    if (p->buf) {
+        // Preserve the complete GPU address range, but pin it only on first use.
+        // Commit here so uploads and every command-buffer path see residency.
+        if (!p->resident) {
+            res_add(p->buf); res_commit(); p->resident = 1;
+            MLOG("内存池按需驻留：%llu MiB，完整映射已驻留并提交", (unsigned long long)((p->hi - p->lo) >> 20));
+        }
+        *off = addr - p->base; return p->buf;
+    }
+    for (NvPoolRange *r in g_pool_ranges) if (r->key == p->key && addr >= r->lo && addr < r->hi && len <= r->hi - addr) { *off = addr - r->lo; return r->buf; }
+    uintptr_t pg = getpagesize(), window = 1 << 20;
+    uintptr_t lo = addr & ~(window - 1); if (lo < p->base) lo = p->base;
+    uintptr_t end = (p->hi + pg - 1) & ~(pg - 1), hi = (addr + len + pg - 1) & ~(pg - 1);
+    if (hi < lo + window) hi = lo + window; if (hi > end) hi = end;
+    NvPoolRange *r = [NvPoolRange new]; r->key = p->key; r->lo = lo; r->hi = hi;
+    r->buf = [g_dev newBufferWithBytesNoCopy:(void *)lo length:hi - lo options:MTLResourceStorageModeShared deallocator:nil];
+    if (!r->buf) MDIE("经典内存池范围建缓冲失败 %p+%lu", (void *)lo, (unsigned long)(hi - lo));
+    res_add(r->buf); if (!g_pool_ranges) g_pool_ranges = [NSMutableArray array]; [g_pool_ranges addObject:r];
+    *off = addr - lo; return r->buf;
+}
 static uint64_t g_pool_adds;
 
 #define C1_BANK_SIZE (4u << 20)
@@ -247,6 +294,10 @@ static void udc_selftest(void) {
 }
 void mtl_init(void) {
     if (g_dev) return;
+    // Diagnostic only: retain complete mappings for shader/vertex pools, and
+    // map only the accessed ranges of pools at least 512 MiB in size.
+    const char *pool_ranges = getenv("DM_CLASSIC_LARGE_POOL_RANGES");
+    if (pool_ranges && !strcmp(pool_ranges, "1")) g_classic_pool_ranges = 2;
     const char *link = getenv("DM_PRESENT_LINK");
     g_dm_present_link = link ? atoi(link) : 1; if (g_dm_present_link < 0 || g_dm_present_link > 2) g_dm_present_link = 1;   // 缺省 1（真机同进程交替：负载超一拍时长帧 15% → 0、帧间隔变匀；稳 60 时与 0 无差别）；DM_PRESENT_LINK=0 关   // 1 = 60 Hz 节拍每拍出图；2 = 120 Hz 节拍、游戏隔拍出一帧（落后时下一个 8.33 ms 拍就能上屏） | Default 1 (real-device same-process alternation: when load exceeds one display-link period, long frames 15% → 0 and frame intervals even out; no difference from 0 at a steady 60); DM_PRESENT_LINK=0 turns it off   // 1 = present on every tick of a 60 Hz display link; 2 = 120 Hz display link, the game presents a frame every other display-link tick (when behind, it can present on the next 8.33 ms display-link tick)
     const char *latency = getenv("DM_PRESENT_LATENCY");
@@ -341,31 +392,37 @@ void mtl_pool_add(const void *mem, uint64_t size) {
     mtl_init(); g_reg_gen++;
     uintptr_t pg = (uintptr_t)getpagesize(), lo = (uintptr_t)mem, hi = lo + size;
     uintptr_t a = lo & ~(pg - 1), b = (hi + pg - 1) & ~(pg - 1);
-    id<MTLBuffer> buf = [g_dev newBufferWithBytesNoCopy:(void *)a length:b - a options:MTLResourceStorageModeShared deallocator:nil];
-    if (!buf) MDIE("内存池 %p+%#llx 建零拷贝缓冲失败", mem, (unsigned long long)size);
-    res_add(buf);
+    int whole = g_m4 || !g_classic_pool_ranges || (g_classic_pool_ranges == 2 && size < (512ull << 20));
+    id<MTLBuffer> buf = whole ? [g_dev newBufferWithBytesNoCopy:(void *)a length:b - a options:MTLResourceStorageModeShared deallocator:nil] : nil;
+    if (whole && !buf) MDIE("内存池 %p+%#llx 建零拷贝缓冲失败", mem, (unsigned long long)size);
+    // Do not pin unused pools (in particular the 512 MiB render-target pool).
     pthread_mutex_lock(&g_mu);
     if (g_npool == g_cap) { g_cap = g_cap ? g_cap * 2 : 64; g_pools = realloc(g_pools, g_cap * sizeof *g_pools); }
-    g_pools[g_npool++] = (pool_ent){lo, hi, a, buf, buf.gpuAddress, mem};
+    g_pools[g_npool++] = (pool_ent){lo, hi, a, buf, buf.gpuAddress, mem, 0};
     g_pool_adds++;
-    [g_keep addObject:buf];
+    if (buf) [g_keep addObject:buf];
     pthread_mutex_unlock(&g_mu);
 }
 
 void mtl_pool_del(const void *mem) {
     g_reg_gen++;
+    id<MTLBuffer> gone = nil;
     pthread_mutex_lock(&g_mu);
     for (int i = 0; i < g_npool; i++)
-        if (g_pools[i].key == mem) { [g_keep removeObject:g_pools[i].buf]; g_pools[i] = g_pools[--g_npool]; break; }
+        if (g_pools[i].key == mem) { gone = g_pools[i].buf; if (gone) [g_keep removeObject:gone]; g_pools[i] = g_pools[--g_npool]; break; }
+    for (NSInteger i = (NSInteger)g_pool_ranges.count - 1; i >= 0; i--) {
+        NvPoolRange *r = g_pool_ranges[(NSUInteger)i]; if (r->key == mem) { defer_obj_release(r->buf); [g_pool_ranges removeObjectAtIndex:(NSUInteger)i]; }
+    }
     pthread_mutex_unlock(&g_mu);
+    defer_obj_release(gone); // Retire after GPU completion and remove the residency-set reference.
 }
 
 int mtl_addr(uint64_t addr, uint64_t len, void **buf, uint64_t *off) {
     int ok = 0;
     pthread_mutex_lock(&g_mu);
     for (int i = 0; i < g_npool; i++)
-        if (addr >= g_pools[i].lo && addr + len <= g_pools[i].hi) {
-            *buf = (__bridge void *)g_pools[i].buf; *off = addr - g_pools[i].base; ok = 1; break;
+        if (addr >= g_pools[i].lo && addr < g_pools[i].hi && len <= g_pools[i].hi - addr) {
+            *buf = (__bridge void *)pool_buffer(&g_pools[i], addr, len ? len : 1, off); ok = 1; break;
         }
     pthread_mutex_unlock(&g_mu);
     return ok;
@@ -374,8 +431,8 @@ int mtl_gpu_addr(uint64_t addr, uint64_t len, void **buf, uint64_t *off, uint64_
     int ok = 0;
     pthread_mutex_lock(&g_mu);
     for (int i = 0; i < g_npool; i++)
-        if (addr >= g_pools[i].lo && addr + len <= g_pools[i].hi) {
-            *buf = (__bridge void *)g_pools[i].buf; *off = addr - g_pools[i].base; *gpu = g_pools[i].gpu + *off; ok = 1; break;
+        if (addr >= g_pools[i].lo && addr < g_pools[i].hi && len <= g_pools[i].hi - addr) {
+            id<MTLBuffer> b = pool_buffer(&g_pools[i], addr, len ? len : 1, off); *buf = (__bridge void *)b; *gpu = b.gpuAddress + *off; ok = 1; break;
         }
     pthread_mutex_unlock(&g_mu);
     return ok;
@@ -461,6 +518,7 @@ static int tbdr_on(void);
 static uint64_t g_sub_serial;   // 第几次提交（并行预编「每次提交只预测一次」用） | Submission index (used by the parallel precompile's 'predict only once per submission')
 void mtl_sub_begin(void) {
     mtl_init(); g_sub_serial++;
+    if (!g_m4) gate_poll();
     if (tbdr_on() == 0 && g_ruler_pending) { g_ruler_truth = 0; g_ruler_pending = 0; MLOG("DM_NVN_RULER：切到被测模式"); }
     defer_drain();
     defer_reset();
@@ -516,10 +574,13 @@ static void ser_gate(void) {
 // Metal 4 conservative barriers (first version): a consumer barrier at the start of an encoder (all prior work → this encoder) and a producer barrier at the end (this encoder and earlier → later encoders).
 // Only the one at the start is not enough: t_rt_range 'pass 1 → pass 2 → copy' read back black, and after adding the end barrier it is 19/19. Old-queue encoders (upload / diagnostics / present) do not go through these barriers.
 static inline void m4_end(id e) {
-    if ([e conformsToProtocol:@protocol(MTL4CommandEncoder)]) [(id<MTL4CommandEncoder>)e barrierAfterStages:MTLStageAll beforeQueueStages:MTLStageAll visibilityOptions:MTL4VisibilityOptionDevice];
+    if (g_m4 && [e conformsToProtocol:@protocol(MTL4CommandEncoder)]) [(id<MTL4CommandEncoder>)e barrierAfterStages:MTLStageAll beforeQueueStages:MTLStageAll visibilityOptions:MTL4VisibilityOptionDevice];   // conformsToProtocol 在无 Metal 4 的机型上也会答 YES（桩），须先看 g_m4 | conformsToProtocol also answers YES on machines without Metal 4 (stubs); check g_m4 first
     [e endEncoding];
 }
-static inline id<MTL4RenderCommandEncoder> enc_r_begin(MTL4RenderPassDescriptor *d) { id<MTL4RenderCommandEncoder> e = [g_cb renderCommandEncoderWithDescriptor:d]; [e barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:MTL4VisibilityOptionDevice]; [e setArgumentTable:g_vt atStages:MTLRenderStageVertex]; [e setArgumentTable:g_ft atStages:MTLRenderStageFragment]; return e; }
+static inline id<MTL4RenderCommandEncoder> enc_r_begin(MTL4RenderPassDescriptor *d) {
+    if (!g_m4) return (id<MTL4RenderCommandEncoder>)[(id<MTLCommandBuffer>)g_cb renderCommandEncoderWithDescriptor:(MTLRenderPassDescriptor *)d];   // 经典：同一选择子；屏障与参数表都不用（同命令缓冲内编码器按序执行；绑定走编码器逐槽 setter） | Classic: same selector; no barrier and no argument tables (encoders within a command buffer execute in order; binding goes through per-slot encoder setters)
+    id<MTL4RenderCommandEncoder> e = [g_cb renderCommandEncoderWithDescriptor:d]; [e barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:MTL4VisibilityOptionDevice]; [e setArgumentTable:g_vt atStages:MTLRenderStageVertex]; [e setArgumentTable:g_ft atStages:MTLRenderStageFragment]; return e;
+}
 static inline void enc_r_end(id e) { m4_end(e); }
 static inline void enc_r_pso(id<MTL4RenderCommandEncoder> e, id<MTLRenderPipelineState> p) { [e setRenderPipelineState:p]; }
 static inline void enc_r_dss(id<MTL4RenderCommandEncoder> e, id<MTLDepthStencilState> s) { [e setDepthStencilState:s]; }
@@ -533,17 +594,24 @@ static inline void enc_r_depth_clip(id<MTL4RenderCommandEncoder> e, BOOL v) { [e
 static inline void enc_r_stencil_ref(id<MTL4RenderCommandEncoder> e, uint32_t f, uint32_t b) { (void)b; [e setStencilReferenceValue:f]; }
 static inline void enc_r_blend_color(id<MTL4RenderCommandEncoder> e, float r, float g, float b, float a) { [e setBlendColorRed:r green:g blue:b alpha:a]; }
 static inline void enc_r_visibility(id<MTL4RenderCommandEncoder> e, MTLVisibilityResultMode m, NSUInteger o) { [e setVisibilityResultMode:m offset:o]; }
-static inline void enc_r_vbuf(id<MTL4RenderCommandEncoder> e, NSUInteger i, uint64_t gpu) { (void)e; [g_vt setAddress:gpu atIndex:i]; }
+static inline void enc_r_vbuf(id<MTL4RenderCommandEncoder> e, NSUInteger i, uint64_t gpu, id<MTLBuffer> buf, NSUInteger off) {
+    if (!g_m4) { [(id<MTLRenderCommandEncoder>)e setVertexBuffer:buf offset:off atIndex:i]; return; }   // 经典：使用调用方已解析的对象与偏移，不把 GPU 地址当客体地址反查 | Classic: bind the resolved object and offset; GPU addresses are not guest addresses
+    (void)e; [g_vt setAddress:gpu atIndex:i];
+}
 static inline void enc_r_args(id<MTL4RenderCommandEncoder> e, MTLRenderStages s, uint64_t gpu, NSUInteger i) { (void)e; [(s == MTLRenderStageVertex ? g_vt : g_ft) setAddress:gpu atIndex:i]; }
-static inline void enc_r_draw(id<MTL4RenderCommandEncoder> e, MTLPrimitiveType p, NSUInteger v, NSUInteger n) { [e drawPrimitives:p vertexStart:v vertexCount:n]; }
-static inline void enc_r_draw_instanced(id<MTL4RenderCommandEncoder> e, MTLPrimitiveType p, NSUInteger v, NSUInteger n, NSUInteger i, NSUInteger b) { [e drawPrimitives:p vertexStart:v vertexCount:n instanceCount:i baseInstance:b]; }
-static inline void enc_r_draw_indexed(id<MTL4RenderCommandEncoder> e, MTLPrimitiveType p, NSUInteger n, MTLIndexType t, uint64_t gpu, NSUInteger len, NSUInteger i, NSInteger bv, NSUInteger bi) { [e drawIndexedPrimitives:p indexCount:n indexType:t indexBuffer:gpu indexBufferLength:len instanceCount:i baseVertex:bv baseInstance:bi]; }
-static inline id<MTL4ComputeCommandEncoder> enc_c_begin(MTLComputePassDescriptor *d) { (void)d; id<MTL4ComputeCommandEncoder> e = [g_cb computeCommandEncoder]; [e barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:MTL4VisibilityOptionDevice]; [e setArgumentTable:g_ct]; return e; }
+static inline void enc_r_draw(id<MTL4RenderCommandEncoder> e, MTLPrimitiveType p, NSUInteger v, NSUInteger n) { if (g_dm_gate < 3) return; [e drawPrimitives:p vertexStart:v vertexCount:n]; }
+static inline void enc_r_draw_instanced(id<MTL4RenderCommandEncoder> e, MTLPrimitiveType p, NSUInteger v, NSUInteger n, NSUInteger i, NSUInteger b) { if (g_dm_gate < 3) return; [e drawPrimitives:p vertexStart:v vertexCount:n instanceCount:i baseInstance:b]; }
+static inline void enc_r_draw_indexed(id<MTL4RenderCommandEncoder> e, MTLPrimitiveType p, NSUInteger n, MTLIndexType t, uint64_t gpu, NSUInteger len, NSUInteger i, NSInteger bv, NSUInteger bi, id<MTLBuffer> buf, NSUInteger off) {
+    if (g_dm_gate < 3) return;
+    if (!g_m4) { [(id<MTLRenderCommandEncoder>)e drawIndexedPrimitives:p indexCount:n indexType:t indexBuffer:buf indexBufferOffset:off instanceCount:i baseVertex:bv baseInstance:bi]; return; }   // 经典：索引缓冲按（对象，偏移）绘 | Classic: draw with the index buffer as (object, offset)
+    [e drawIndexedPrimitives:p indexCount:n indexType:t indexBuffer:gpu indexBufferLength:len instanceCount:i baseVertex:bv baseInstance:bi];
+}
+static inline id<MTL4ComputeCommandEncoder> enc_c_begin(MTLComputePassDescriptor *d) { (void)d; if (!g_m4) return (id<MTL4ComputeCommandEncoder>)[(id<MTLCommandBuffer>)g_cb computeCommandEncoder]; id<MTL4ComputeCommandEncoder> e = [g_cb computeCommandEncoder]; [e barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:MTL4VisibilityOptionDevice]; [e setArgumentTable:g_ct]; return e; }
 static inline id<MTLComputeCommandEncoder> enc_c_begin_concurrent(id<MTLCommandBuffer> cb) { return [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent]; }
 static inline void enc_c_end(id e) { m4_end(e); }
 static inline void enc_c_pso(id e, id<MTLComputePipelineState> p) { [e setComputePipelineState:p]; }
 static inline void enc_c_args(id e, uint64_t gpu, NSUInteger i) { (void)e; [g_ct setAddress:gpu atIndex:i]; }
-static inline void enc_c_dispatch(id e, MTLSize n, MTLSize t) { [e dispatchThreadgroups:n threadsPerThreadgroup:t]; }
+static inline void enc_c_dispatch(id e, MTLSize n, MTLSize t) { if (g_dm_gate < 3) return; [e dispatchThreadgroups:n threadsPerThreadgroup:t]; }
 static inline id enc_b_begin(id cb) { return [cb respondsToSelector:@selector(beginCommandBufferWithAllocator:)] ? [cb computeCommandEncoder] : [cb blitCommandEncoder]; }
 static inline void enc_b_end(id e) { m4_end(e); }
 static inline void enc_b_copy_buffer(id e, id<MTLBuffer> s, NSUInteger so, id<MTLBuffer> d, NSUInteger doff, NSUInteger n) { [e copyFromBuffer:s sourceOffset:so toBuffer:d destinationOffset:doff size:n]; }
@@ -551,7 +619,7 @@ static inline void enc_b_copy_buffer_texture(id e, id<MTLBuffer> s, NSUInteger s
 static inline void enc_b_copy_texture_buffer(id e, id<MTLTexture> s, NSUInteger sl, NSUInteger lv, MTLOrigin o, MTLSize z, id<MTLBuffer> d, NSUInteger doff, NSUInteger row, NSUInteger img) { [e copyFromTexture:s sourceSlice:sl sourceLevel:lv sourceOrigin:o sourceSize:z toBuffer:d destinationOffset:doff destinationBytesPerRow:row destinationBytesPerImage:img]; }
 static inline void enc_b_copy_texture(id e, id<MTLTexture> s, NSUInteger sl, NSUInteger lv, MTLOrigin so, MTLSize z, id<MTLTexture> d, NSUInteger dl, NSUInteger dv, MTLOrigin doo) { [e copyFromTexture:s sourceSlice:sl sourceLevel:lv sourceOrigin:so sourceSize:z toTexture:d destinationSlice:dl destinationLevel:dv destinationOrigin:doo]; }
 static void blit_note(void);   // 逐通道转储：拷贝 / 缓冲更新结束了渲染通道（定义在 PD 之后） | Per-pass dump: a copy / buffer update ended the render pass (defined after PD)
-static id<MTL4ComputeCommandEncoder> blit(void) { blit_note(); rp_end(); if (!g_blit) { ser_gate(); g_blit = enc_b_begin(g_cb); [g_blit barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:MTL4VisibilityOptionDevice]; } return g_blit; }
+static id<MTL4ComputeCommandEncoder> blit(void) { blit_note(); rp_end(); if (!g_blit) { ser_gate(); g_blit = enc_b_begin(g_cb); if (g_m4) [g_blit barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:MTL4VisibilityOptionDevice]; } return g_blit; }
 
 void mtl_sub_copy(uint64_t src, uint64_t dst, uint64_t n) {
     if (g_npend < PEND_MAX) { g_pend_lo[g_npend] = dst; g_pend_hi[g_npend++] = dst + n; } else g_pend_over = 1;
@@ -1095,7 +1163,6 @@ void mtl_create_stats(uint64_t *lib, uint64_t *pso) { *lib = g_bp_lib_n; *pso = 
 void mtl_create_ns(uint64_t *lib_ns, uint64_t *pso_ns) { *lib_ns = g_bp_lib_ns; *pso_ns = g_bp_pso_ns; }   // 同步现建着色器库 / 管线的累计耗时（长帧日志按帧取差） | Cumulative time spent synchronously creating shader libraries / pipelines on the spot (the long-frame log takes the per-frame difference)
 uint64_t mtl_upload_bytes(void) { return g_bp_up_bytes; }   // 贴图上传累计字节 | Cumulative texture upload bytes
 static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp) {
-    if (!g_m4) return nil;   // P0 经典回退：贴图数据不上传（出图走清屏，不需要内容） | P0 classic fallback: texture data is not uploaded (present uses the clear color; no content needed)
     MTLTextureDescriptor *d = tex_desc(t, 1);
     if (!d) return nil;
     id<MTLTexture> mt = [g_dev newTextureWithDescriptor:d];
@@ -1114,11 +1181,11 @@ static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp) {
     }
     g_bp_up_bytes += total;
     void *mb; uint64_t mo;
-    int gdec = unp && t->d.target != 2 && bcd_fmt(t->d.format) && bcd_pso();   // 无 BC 的 BC1–5：GPU 解排布 + GPU 解压 | BC1–5 without BC: GPU deswizzle + GPU decompression
+    int gdec = g_m4 && unp && t->d.target != 2 && bcd_fmt(t->d.format) && bcd_pso();   // 无 BC 的 BC1–5：GPU 解排布 + GPU 解压 | BC1–5 without BC: GPU deswizzle + GPU decompression
     size_t ctotal = 0;   // 压缩块的暂存大小（GPU 解压时暂存区放的是压缩块） | Staging size of the compressed blocks (with GPU decompression the staging area holds compressed blocks)
     if (gdec) for (unsigned l = 0; l < d.mipmapLevelCount; l++) { uint32_t w = MAX(t->d.width >> l, 1u), h = MAX(t->d.height >> l, 1u); ctotal += (size_t)((w + bw - 1) / bw) * bpb * ((h + bh - 1) / bh) * layers; }
-    int use_gpu = (!unp || gdec) && g_nvn_deswz_gpu && mtl_addr((uint64_t)t->mem, t->L.size, &mb, &mo);
-    if (g_nvn_deswz_gpu && !use_gpu && !unp) RED_ONCE(40, "预排布贴图存储不在内存池里，回退 CPU");
+    int use_gpu = g_m4 && (!unp || gdec) && g_nvn_deswz_gpu && mtl_addr((uint64_t)t->mem, t->L.size, &mb, &mo);
+    if (g_m4 && g_nvn_deswz_gpu && !use_gpu && !unp) RED_ONCE(40, "预排布贴图存储不在内存池里，回退 CPU");
     if (use_gpu) {
         // GPU 执行时读内存池，比 CPU 上传时刻快照更接近 Switch 真机；脏页戳仍在编码前取，之后写入仍会触发重传。
         // The GPU reads the memory pool at execution time, which is closer to a real Switch than a snapshot at CPU upload time; the dirty-page stamp is still taken before encoding, and later writes still trigger a re-upload.
@@ -1157,7 +1224,9 @@ static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp) {
 
     up_begin();
     id<MTLBuffer> stg = [g_dev newBufferWithLength:total ? total : 16 options:MTLResourceStorageModeShared];
-    res_add(stg); [g_up_keep addObject:stg];
+    res_add(stg); if (g_m4) [g_up_keep addObject:stg];
+    id<MTLCommandBuffer> classic_cb = g_m4 ? nil : [g_q commandBuffer];
+    id<MTLBlitCommandEncoder> classic_blit = classic_cb ? [classic_cb blitCommandEncoder] : nil;
     size_t off = 0;
     for (unsigned l = 0; l < d.mipmapLevelCount; l++) {
         uint32_t w = MAX(t->d.width >> l, 1u), h = MAX(t->d.height >> l, 1u), z = t->d.target == 2 ? MAX(t->d.depth >> l, 1u) : 1;
@@ -1168,16 +1237,22 @@ static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp) {
                 if (!cb || nvn_deswizzle(&t->d, l, y, t->mem, cb, pitch)) { free(cb); RED_ONCE(9, "解排布失败 格式 %#x 目标 %d", t->d.format, t->d.target); break; }
                 for (uint32_t zi = 0; zi < z; zi++) nvn_bc_decode(t->d.format, cb + zi * pitch * rows, pitch, w, h, (uint8_t *)stg.contents + off + zi * up * h, up);
                 free(cb);
-                up_blit_add(stg, off, up, up * h, MTLSizeMake(w, h, z), mt, y, l);
+                if (classic_blit) enc_b_copy_buffer_texture(classic_blit, stg, off, up, up * h, MTLSizeMake(w, h, z), mt, y, l, MTLOriginMake(0, 0, 0));
+                else up_blit_add(stg, off, up, up * h, MTLSizeMake(w, h, z), mt, y, l);
                 off += up * h * z;
                 continue;
             }
             if (nvn_deswizzle(&t->d, l, y, t->mem, (uint8_t *)stg.contents + off, pitch)) { RED_ONCE(9, "解排布失败 格式 %#x 目标 %d", t->d.format, t->d.target); break; }
-            up_blit_add(stg, off, pitch, pitch * rows, MTLSizeMake(w, h, z), mt, y, l);
+            if (classic_blit) enc_b_copy_buffer_texture(classic_blit, stg, off, pitch, pitch * rows, MTLSizeMake(w, h, z), mt, y, l, MTLOriginMake(0, 0, 0));
+            else up_blit_add(stg, off, pitch, pitch * rows, MTLSizeMake(w, h, z), mt, y, l);
             off += pitch * rows * z;
         }
     }
-    up_flush();
+    if (classic_cb) {
+        [classic_blit endEncoding]; res_commit(); [classic_cb commit]; [classic_cb waitUntilCompleted];
+        res_remove(stg);
+        if (classic_cb.error) { MLOG("【红】经典贴图上传失败：%s", classic_cb.error.description.UTF8String); res_remove(mt); return nil; }
+    } else up_flush();
     return mt;
 }
 static id<MTLTexture> tex_mtl(const tex_t *ct) {
@@ -1681,7 +1756,7 @@ static id<MTL4RenderCommandEncoder> rp_begin_ex(int clear_only) {
     if (rt_range_on()) { reg0 = g_reg_gen; ser0 = g_ser_gen; }
     if (rt_range_on()) dirty0=nvn_dirty_now();
     if (g_blit) { enc_b_end(g_blit); g_blit = nil; }
-    MTL4RenderPassDescriptor *pd = [MTL4RenderPassDescriptor new];
+    MTLRenderPassDescriptor *pd = g_m4 ? (MTLRenderPassDescriptor *)[MTL4RenderPassDescriptor new] : [MTLRenderPassDescriptor renderPassDescriptor];   // Both backends defer Unknown store actions until sd_finish resolves them on the encoder.
     int any = 0;
     for (int i = 0; i < R.rt.n; i++) {
         if (!R.rt.color[i] || (clear_only == 1 && !R.clear_c[i])) continue;
@@ -1796,7 +1871,9 @@ static id<MTL4RenderCommandEncoder> rp_begin_ex(int clear_only) {
     { void td_note(id pd, NSUInteger nc); td_note(pd, (NSUInteger)R.rt.n);
       void ts_note(id pd, NSUInteger nc); ts_note(pd, (NSUInteger)R.rt.n); }
     ser_gate();
-    g_enc = enc_r_begin(pd);
+    // Keep Unknown until sd_finish calls the encoder's set*StoreAction methods.
+    // Classic Metal forbids changing an action that was known at encoder creation.
+    g_enc = enc_r_begin((MTL4RenderPassDescriptor *)pd);
     args_dirty_all();
     g_stat_pass++;
     if (enc_label_on()) { id<MTLTexture> lt = pd.colorAttachments[0].texture ?: pd.depthAttachment.texture ?: pd.stencilAttachment.texture; g_el_w = (int)lt.width; g_el_h = (int)lt.height; g_el_draws = 0; g_el_key[0] = 0; }
@@ -2226,7 +2303,15 @@ static id<MTLSamplerState> samp_by_id(int sid) {   // 调用方持 g_rmu | Calle
     d.lodMinClamp = p.lod_min < 0 ? 0 : p.lod_min; d.lodMaxClamp = p.lod_max;
     d.maxAnisotropy = p.aniso < 1 ? 1 : p.aniso > 16 ? 16 : (NSUInteger)p.aniso;
     if (p.cmp_mode) d.compareFunction = (MTLCompareFunction)(p.cmp_func - 1);
-    d.borderColor = p.border[3] > 0.5f ? (p.border[0] > 0.5f ? MTLSamplerBorderColorOpaqueWhite : MTLSamplerBorderColorOpaqueBlack) : MTLSamplerBorderColorTransparentBlack;
+    BOOL border_supported = [g_dev supportsFamily:MTLGPUFamilyApple7] || [g_dev supportsFamily:MTLGPUFamilyMac2];
+    if (!border_supported) {
+        // A13 has no border-color sampler support. Transparent black maps exactly to clamp-to-zero.
+        MTLSamplerAddressMode fallback = p.border[3] > 0.5f ? MTLSamplerAddressModeClampToEdge : MTLSamplerAddressModeClampToZero;
+        if (d.sAddressMode == MTLSamplerAddressModeClampToBorderColor) d.sAddressMode = fallback;
+        if (d.tAddressMode == MTLSamplerAddressModeClampToBorderColor) d.tAddressMode = fallback;
+        if (d.rAddressMode == MTLSamplerAddressModeClampToBorderColor) d.rAddressMode = fallback;
+    }
+    if (border_supported) d.borderColor = p.border[3] > 0.5f ? (p.border[0] > 0.5f ? MTLSamplerBorderColorOpaqueWhite : MTLSamplerBorderColorOpaqueBlack) : MTLSamplerBorderColorTransparentBlack;
     d.supportArgumentBuffers = YES;
     id<MTLSamplerState> s = [g_dev newSamplerStateWithDescriptor:d];
     if (s) { g_sview[sid] = (void *)CFBridgingRetain(s); g_srid[sid] = s.gpuResourceID._impl; }
@@ -2646,6 +2731,12 @@ static inline void args_sync_dirty(void) {
     }
 }
 static void bind_args(id<MTLCommandEncoder> en, int nvn_stage, int metal_vertex, id<MTLBuffer> ab, uint64_t gpu, size_t off, NSUInteger ai) {
+    if (!g_m4) {   // 经典：IAB 缓冲对象直接逐槽绑（gpu 地址是竞技场的，反查不了，用现成对象）；按阶段分槽——顶点 IAB 只进顶点槽、片段 IAB 只进片段槽（绑同槽会互相顶掉，着色器读到布局不符的参数缓冲即 GPU 页错误） | Classic: bind the IAB buffer object per slot directly (arena gpu address, use the object at hand); slot follows the stage - the vertex IAB goes only into the vertex slot, the fragment IAB only into the fragment slot (binding both into the same slot clobbers each other, and a shader reading a mismatched argument buffer causes a GPU page fault)
+        if (nvn_stage == 5) [(id<MTLComputeCommandEncoder>)en setBuffer:ab offset:off atIndex:ai];
+        else if (metal_vertex) [(id<MTLRenderCommandEncoder>)en setVertexBuffer:ab offset:off atIndex:ai];
+        else [(id<MTLRenderCommandEncoder>)en setFragmentBuffer:ab offset:off atIndex:ai];
+        (void)gpu; return;
+    }
     if (nvn_stage == 5) enc_c_args((id<MTLComputeCommandEncoder>)en, gpu, ai);
     else enc_r_args((id<MTLRenderCommandEncoder>)en, metal_vertex ? MTLRenderStageVertex : MTLRenderStageFragment, gpu, ai);
 }
@@ -2684,14 +2775,27 @@ static uint64_t ui_mat_patch(const p_bind_buf *u, void *mb, uint64_t mo) {
 }
 static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, int metal_vertex) {
     if (!sh->ae) return 1;
+    if (!g_m4 && g_dm_gate < 2) return 1;   // 闸门 1：重放但不绑参数 | Gate 1: replay without argument binding
     uint64_t slots[NVN_REFL_MAXB] = {0};
     args_sync_dirty();
-    if (!passdump() && !g_args_dirty[nvn_stage] && sh->ab_buf && sh->ab_pass == g_pass.serial && nvn_stage != 5) {
+    if (!passdump() && g_m4 && !g_args_dirty[nvn_stage] && sh->ab_buf && sh->ab_pass == g_pass.serial && nvn_stage != 5) {   // 经典不复用缓存 IAB：useResource 按编码器生效，换编码器必须重声明资源 | Classic does not reuse the cached IAB: useResource is per-encoder, resources must be redeclared when the encoder changes
         bind_args(en, nvn_stage, metal_vertex, sh->ab_buf, sh->ab_gpu, sh->ab_off, sh->rf.abi);
         g_stat_args_reuse++;
         return 1;
     }
-    #define USE(r, u) do { (void)(u); if (__builtin_expect(g_res_check_on, 0)) res_check((r), sh->key, reg); } while (0)
+    // 经典：IAB 内引用的资源不被自动追踪，必须逐个 useResource（MTL4 靠参数表 + 驻留集，全库无 useResource）；采样器不是资源，走 USE_S 只做诊断
+    // Classic: resources referenced inside an IAB are not auto-tracked and must be useResource'd one by one (MTL4 used argument tables + residency sets, so the whole tree has no useResource); samplers are not resources, USE_S only does diagnostics
+    #define USE(r, u) do { if (!g_m4 && (r)) { if (nvn_stage == 5) [(id<MTLComputeCommandEncoder>)en useResource:(id<MTLResource>)(r) usage:(MTLResourceUsage)(u)]; else [(id<MTLRenderCommandEncoder>)en useResource:(id<MTLResource>)(r) usage:(MTLResourceUsage)(u)]; } if (__builtin_expect(g_res_check_on, 0)) res_check((r), sh->key, reg); } while (0)
+    #define USE_S(r) do { if (__builtin_expect(g_res_check_on, 0)) res_check((r), sh->key, reg); } while (0)
+    // 经典回退：IAB 不能 memcpy 裸 rid / 地址字节（经典参数缓冲的句柄是编码器私有的），先领 IAB 场地，把 sh->ae 指过去，循环里逐槽 set*；MTL4 路径照旧填 slots[] 后 memcpy
+    // Classic fallback: the IAB cannot take raw rid / address bytes memcpy'd (classic argument-buffer handles are encoder-private); claim the IAB storage first, point sh->ae at it, and set* per slot inside the loop; the MTL4 path keeps filling slots[] and memcpy'ing
+    NSUInteger arg_len0 = sh->arg_len ? sh->arg_len : sh->ae.encodedLength;
+    id<MTLBuffer> ab0; size_t off0 = arena_alloc(arg_len0, &ab0);
+    id<MTLArgumentEncoder> ae = g_m4 ? nil : sh->ae;
+    if (ae) [ae setArgumentBuffer:ab0 offset:off0];
+    #define AE_SETBUF(b, o) do { if (ae) [ae setBuffer:(b) offset:(o) atIndex:aid]; } while (0)
+    #define AE_SETTEX(t)    do { if (ae) [ae setTexture:(t) atIndex:aid]; } while (0)
+    #define AE_SETSAMP(s)   do { if (ae) [ae setSamplerState:(s) atIndex:aid]; } while (0)
     // DM_NVN_PASSDUMP：每通道每阶段第一次新编时记着色器键（K）与各绑定的实际来源（B：UBO 地址 / 长度 / 前 4 个浮点，贴图号与序号或「哑」）
     // DM_NVN_PASSDUMP: on the first new encode per pass per stage, records the shader key (K) and the actual source of each binding (B: UBO address / length / first 4 floats, texture ID and serial, or 「哑」(dummy))
     static uint64_t bl_pass[6]; static int bl_all = -1; if (bl_all < 0) bl_all = getenv("DM_NVN_PASSDUMP_ALL") != NULL;   // 每次新编都记（否则只记每通道每阶段第一次） | Record on every new encode (otherwise only the first time per pass per stage)
@@ -2704,7 +2808,7 @@ static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, in
         if (b->kind == NVN_RB_CBUF) {
             const p_bind_buf *u = reg < 16 ? &S.ubo[nvn_stage][reg] : NULL;
             void *mb; uint64_t mo, gpu;
-            if (!u || !u->addr || !mtl_gpu_addr(u->addr, 1, &mb, &mo, &gpu)) { RED_ONCE(16, "阶段 %d cb%d 没有绑定 uniform 缓冲", nvn_stage, reg); continue; }
+            if (!u || !u->addr || !mtl_gpu_addr(u->addr, u->size ? u->size : 1, &mb, &mo, &gpu)) { RED_ONCE(16, "阶段 %d cb%d 没有绑定 uniform 缓冲", nvn_stage, reg); continue; }
             use_rec("buf", u->addr, u->size, 0, NULL);
             if (nvn_stage == 0 && reg == 0 && g_ui_moff != 0) { uint64_t pg = ui_mat_patch(u, mb, mo); if (pg) gpu = pg; }
             if (bl) {
@@ -2719,12 +2823,14 @@ static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, in
                 }
             }
             slots[aid] = gpu;
+            AE_SETBUF((__bridge id<MTLBuffer>)mb, mo);   // 经典（ui_mat_patch 的替换副本未跟：P2a 先用原缓冲，UI 矩阵补丁后续再经典化） | Classic (the ui_mat_patch replacement copy is not followed: P2a uses the original buffer; classicizing the UI matrix patch can come later)
             USE((__bridge id<MTLBuffer>)mb, MTLResourceUsageRead);
         } else if (b->kind == NVN_RB_SAMP || b->kind == NVN_RB_SAMPT) {   // SAMPT：合并句柄（贴图号 | 采样器号 << 20）的采样器部分 | SAMPT: the sampler part of a combined handle (texture ID | sampler ID << 20)
             int sid = reg < 128 ? (int)((b->kind == NVN_RB_SAMPT ? S.tex[nvn_stage][reg] : S.samp[nvn_stage][reg]) >> 20) : 0;
             __unsafe_unretained id<MTLSamplerState> ss = sid ? (__bridge id<MTLSamplerState>)samp_fast(sid) : nil;
             slots[aid] = sid && sid < g_nsreg && g_srid[sid] ? g_srid[sid] : dummy_samp_rid();
-            USE(ss ? ss : dummy_samp(), MTLResourceUsageRead);
+            AE_SETSAMP(ss ?: dummy_samp());
+            USE_S(ss ? ss : dummy_samp());
             if (bl && sid > 0) { int ok = sid < g_nsreg && g_sreg_ok[sid]; samp_par sp = ok ? g_sreg[sid] : (samp_par){0};   // 本段已持 g_rmu | g_rmu is already held in this section
                 if (ok) PD("B %llu st%d samp reg%d sid=%d mag=%d min=%d（0 最近点 / 1 双线性；2–5 带 mip）", g_stat_pass, nvn_stage, reg, sid, (int)sp.magf, (int)sp.minf); }
         } else if (b->kind == NVN_RB_TEX) {
@@ -2738,6 +2844,7 @@ static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, in
                        (unsigned long)(t.parentTexture ? t.parentRelativeSlice : 0), (unsigned long)t.arrayLength, (unsigned long)t.textureType);
             if (!t) { t = dummy_tex(b->dtt, b->dpf); trid = g_dummy_tex_rid[b->dtt & 7][b->dpf & 3]; }
             slots[aid] = trid;
+            AE_SETTEX(t);
             USE(t, MTLResourceUsageRead);
         } else if (b->kind == NVN_RB_IMG) {   // 可写贴图：NVN 图像槽 r（BindImages）↔ D3D u_r | Writable texture: NVN image slot r (BindImages) ↔ D3D u_r
             int tid = reg < 32 ? (int)(S.img[nvn_stage][reg] & 0xfffff) : 0;
@@ -2746,6 +2853,7 @@ static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, in
             if (t && !(t.usage & MTLTextureUsageShaderWrite)) { RED_ONCE(32, "图像槽绑的贴图没有可写用途（贴图号 %d）", tid); t = nil; }
             if (!t) { t = dummy_img(b->dtt, b->dpf); trid = g_dummy_img_rid[b->dtt & 7][b->dpf & 3]; }   // 未绑：D3D 语义写入丢弃——写进专用哑贴图，不污染读出 0 的那套 | Unbound: D3D semantics discard the write - write into a dedicated dummy texture so the set that reads 0 is not polluted
             slots[aid] = trid;
+            AE_SETTEX(t);
             USE(t, MTLResourceUsageRead | MTLResourceUsageWrite);
         } else if (b->kind == NVN_RB_TBUF) {   // 类型化缓冲：贴图槽 r 里的缓冲贴图（目标 BUFFER） | Typed buffer: the buffer texture (target BUFFER) in texture slot r
             int tid = reg < 128 ? (int)(S.tex[nvn_stage][reg] & 0xfffff) : 0;
@@ -2754,19 +2862,22 @@ static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, in
             if (bl) PD("B %llu st%d tbuf reg%d tid=%d %s ser=%llu", g_stat_pass, nvn_stage, reg, tid, t ? "实" : "哑", t && tid < g_ntreg ? g_treg[tid].t.serial : 0ull);
             if (!t) { t = dummy_tbuf(b->dpf); trid = g_dummy_tbuf_rid[b->dpf & 3]; }
             slots[aid] = trid;
+            AE_SETTEX(t);
             USE(t, MTLResourceUsageRead);
         } else if (b->kind == NVN_RB_SBUFP || b->kind == NVN_RB_UBOP) {   // B：存储缓冲 / 计算阶段 uniform 是设备指针，按 NVN 槽取地址 | B: storage buffers / compute-stage uniforms are device pointers; the address is taken by NVN slot
             const p_bind_buf *u = reg < 16 ? (b->kind == NVN_RB_UBOP ? &S.ubo[nvn_stage][reg] : &S.ssbo[nvn_stage][reg]) : NULL;
             void *mb; uint64_t mo, gpu;
-            if (u && u->addr && mtl_gpu_addr(u->addr, u->size ? u->size : 1, &mb, &mo, &gpu)) { use_rec("buf", u->addr, u->size, 0, NULL); slots[aid] = gpu; USE((__bridge id<MTLBuffer>)mb, b->rw ? MTLResourceUsageRead | MTLResourceUsageWrite : MTLResourceUsageRead); }
-            else { slots[aid] = dummy_buf_gpu(); USE(dummy_buf(), MTLResourceUsageRead); }
+            if (u && u->addr && mtl_gpu_addr(u->addr, u->size ? u->size : 1, &mb, &mo, &gpu)) { use_rec("buf", u->addr, u->size, 0, NULL); slots[aid] = gpu; AE_SETBUF((__bridge id<MTLBuffer>)mb, mo); USE((__bridge id<MTLBuffer>)mb, b->rw ? MTLResourceUsageRead | MTLResourceUsageWrite : MTLResourceUsageRead); }
+            else { slots[aid] = dummy_buf_gpu(); AE_SETBUF(dummy_buf(), 0); USE(dummy_buf(), MTLResourceUsageRead); }
             if (bl) PD("B %llu st%d sbufp reg%d %s addr=%#llx size=%llu %s", g_stat_pass, nvn_stage, reg, u && u->addr ? "实" : "哑", u ? (unsigned long long)u->addr : 0ull, u ? (unsigned long long)u->size : 0ull, b->rw ? "rw" : "ro");
         } else if (b->kind == NVN_RB_C1) {      // B：着色器自带常数段，取着色器时建好 | B: the shader's own constant segment, built when the shader is fetched
             id<MTLBuffer> cb = sh->c1buf ? sh->c1buf : zero_bank();   // c1 长 0（全库 600 份）而着色器仍声明：读 0 | c1 has length 0 (600 of them in the whole library) yet the shader still declares it: reads 0
             slots[aid] = (sh->c1buf ? sh->c1_gpu : zero_bank_gpu()) + (sh->c1buf ? sh->c1off : 0);
+            AE_SETBUF(cb, sh->c1buf ? sh->c1off : 0);
             USE(cb, MTLResourceUsageRead);
         } else if (b->kind == NVN_RB_SUPPORT) {   // support_buffer：缩放 1.0、BGRA 互换 0、视口变换未关闭（视口字段不读） | support_buffer: scale 1.0, BGRA swap 0, viewport transform not disabled (viewport fields are not read)
             slots[aid] = support_gpu();
+            AE_SETBUF(support_buf(), 0);
             USE(support_buf(), MTLResourceUsageRead);
         } else if (b->kind == NVN_RB_DRV0 || b->kind == NVN_RB_DRV2) {
             // NVN 驱动常量段：出包时静态统计证明不读的供 0；读的按当前绑定现填——c0 = 存储缓冲表（基址 + 0x10 r：地址 64 位、大小 32 位），
@@ -2774,26 +2885,39 @@ static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, in
             // NVN driver constant segments: those proven unread by static analysis at packaging time are supplied as 0; those read are filled on the spot from the current bindings - c0 = storage buffer table (base + 0x10 r: address 64 bits, size 32 bits),
             // c2 = texture handle table (0x168 + 8 r) and sampler handle table (0x568 + 8 r), the values being the NVN handles the game gave at bind time; positions read outside the tables are registered at packaging time and reported a failure at load time
             int bank = b->kind == NVN_RB_DRV2 ? 2 : 0;
-            if (!sh->rf.drv_read[bank]) { slots[aid] = zero_bank_gpu(); USE(zero_bank(), MTLResourceUsageRead); }
+            if (!sh->rf.drv_read[bank]) { slots[aid] = zero_bank_gpu(); AE_SETBUF(zero_bank(), 0); USE(zero_bank(), MTLResourceUsageRead); }
             else {
                 id<MTLBuffer> db; size_t doff = arena_alloc(0xA00, &db); uint8_t *d = (uint8_t *)db.contents + doff; memset(d, 0, 0xA00);
                 if (bank == 0) {
                     int base = nvn_stage == 0 ? 0x110 : nvn_stage == 5 ? 0x310 : nvn_stage == 1 ? 0x510 : -1;
                     if (base < 0) RED_ONCE(45, "阶段 %d 的着色器读驱动段 c0，存储缓冲表基址未实测", nvn_stage);
-                    else for (int r = 0; r < 16; r++) { uint64_t a = S.ssbo[nvn_stage][r].addr; uint32_t n = (uint32_t)S.ssbo[nvn_stage][r].size; memcpy(d + base + 16 * r, &a, 8); memcpy(d + base + 16 * r + 8, &n, 4); }
+                    else for (int r = 0; r < 16; r++) {
+                        uint64_t a = S.ssbo[nvn_stage][r].addr; uint32_t n = (uint32_t)S.ssbo[nvn_stage][r].size;
+                        if (!g_m4 && g_classic_pool_ranges && a) {
+                            void *mb; uint64_t mo, ga;
+                            if (mtl_gpu_addr(a, n ? n : 1, &mb, &mo, &ga)) { a = ga; USE((__bridge id<MTLBuffer>)mb, MTLResourceUsageRead | MTLResourceUsageWrite); }
+                            else a = 0;
+                        }
+                        memcpy(d + base + 16 * r, &a, 8); memcpy(d + base + 16 * r + 8, &n, 4);
+                    }
                 } else {
                     for (int r = 0; r < 128; r++) { uint32_t th = (uint32_t)S.tex[nvn_stage][r], sh_ = (uint32_t)S.samp[nvn_stage][r]; memcpy(d + 0x168 + 8 * r, &th, 4); memcpy(d + 0x568 + 8 * r, &sh_, 4); }
                 }
                 slots[aid] = g_cur_arena->gpu + doff;
+                AE_SETBUF(db, doff);
                 USE(db, MTLResourceUsageRead);
             }
         } else RED_ONCE(46, "绑定种类 %d 未实现", b->kind);
     }
     #undef USE
+    #undef USE_S
+    #undef AE_SETBUF
+    #undef AE_SETTEX
+    #undef AE_SETSAMP
     pthread_mutex_unlock(&g_rmu);
-    NSUInteger arg_len = sh->arg_len ? sh->arg_len : sh->ae.encodedLength;
-    id<MTLBuffer> ab; size_t off = arena_alloc(arg_len, &ab);
-    memcpy((uint8_t *)ab.contents + off, slots, arg_len);
+    NSUInteger arg_len = arg_len0;
+    id<MTLBuffer> ab = ab0; size_t off = off0;
+    if (!ae) memcpy((uint8_t *)ab.contents + off, slots, arg_len);   // MTL4：裸字节直填；经典：循环里已用编码器写好，不能再 memcpy 覆盖 | MTL4: fill raw bytes; classic: already encoded inside the loop, memcpy would clobber it
     bind_args(en, nvn_stage, metal_vertex, ab, g_cur_arena->gpu + off, off, sh->rf.abi);
     sh->ab_buf = ab; sh->ab_gpu = g_cur_arena->gpu + off; sh->ab_off = off; sh->ab_pass = g_pass.serial; g_args_dirty[nvn_stage] = 0;
     g_stat_args_enc++;
@@ -4105,7 +4229,7 @@ static int fz_p2_draw(NvProg *pr, const p_draw *dw, const p_draw_idx *di, uint8_
 static void bloomq_reset(void) { memset(&g_bloomq, 0, sizeof g_bloomq); }
 static int bloomq_enabled(void) {
     if (g_bloom_q < 0) { const char *e = getenv("DM_NVN_BLOOM_Q"); g_bloom_q = !e || strcmp(e, "0"); }
-    return g_bloom_q;
+    return g_m4 && g_bloom_q;
 }
 static int bloomq_target(uint64_t *ser, int *lv, int *sl) {
     if (!R.has_rt || R.rt.n != 1 || !R.rt.color[0]) return 0;
@@ -4129,6 +4253,7 @@ static int bloomq_make_pipeline(MTLPixelFormat fmt) {
     g_bloomq_samp = [g_dev newSamplerStateWithDescriptor:sd]; return g_bloomq_samp != nil;
 }
 static int bloomq_capture(void) {
+    if (!g_m4) return 0;   // P2a：泛光 1/4 截取通道整段是 MTL4（描述符 + 参数表 + rid）；经典后端跳过，调用方回退原泛光路径 | P2a: the bloom 1/4 capture pass is MTL4 throughout (descriptor + argument table + rid); the classic backend skips it and the caller falls back to the original bloom path
     uint64_t ser; int lv, sl; if (!bloomq_target(&ser, &lv, &sl) || !g_bloomq.s_tex) return 0;
     id<MTLTexture> base = tex_mtl(R.rt.color[0]), src = tex_mtl(g_bloomq.s_tex); if (!base || !src) return 0;
     id<MTLTexture> dst = base; if (lv || sl) { static id<MTLTexture> vb; static int vl, vs; if (vb != base || vl != lv || vs != sl) { g_bloomq_view = [base newTextureViewWithPixelFormat:base.pixelFormat textureType:base.textureType levels:NSMakeRange(lv, 1) slices:NSMakeRange(sl, 1)]; if (g_bloomq_view) res_add(g_bloomq_view); vb = base; vl = lv; vs = sl; } dst = g_bloomq_view; }
@@ -4393,11 +4518,11 @@ frz_plain:;
         if (!S.vbuf[s_].address) continue;
         void *mb; uint64_t mo;
         uint64_t gpu;
-        if (mtl_gpu_addr(S.vbuf[s_].address, 1, &mb, &mo, &gpu)) { enc_r_vbuf(en, 16 + s_, gpu); use_rec("buf", S.vbuf[s_].address, S.vbuf[s_].size, 0, NULL); }
+        if (mtl_gpu_addr(S.vbuf[s_].address, S.vbuf[s_].size ? S.vbuf[s_].size : 1, &mb, &mo, &gpu)) { enc_r_vbuf(en, 16 + s_, gpu, (__bridge id<MTLBuffer>)mb, mo); use_rec("buf", S.vbuf[s_].address, S.vbuf[s_].size, 0, NULL); }
     }
     static id<MTLBuffer> zero; if (!zero) { zero = [g_dev newBufferWithLength:64 options:MTLResourceStorageModeShared]; res_add(zero); }
     static uint64_t zero_gpu; if (!zero_gpu) zero_gpu = zero.gpuAddress;
-    enc_r_vbuf(en, 30, zero_gpu);
+    enc_r_vbuf(en, 30, zero_gpu, zero, 0);
     if (pr->sh[0]) encode_args(en, pr->sh[0], 0, 1);
     if (pr->sh[1]) encode_args(en, pr->sh[1], 1, 0);
     // 参数绑定在登记表锁内捕获实际资源；资格判断到绑定期间有版本变化，则在任何GPU draw前切开重试。
@@ -4472,7 +4597,7 @@ frz_plain:;
             for (uint32_t q = 0; q < n; q++) { uint32_t b = q * 4; uint32_t v[6] = {b, b + 1, b + 2, b, b + 2, b + 3}; memcpy(ix + q * 6, v, 24); }
             g_quad_ib = [g_dev newBufferWithBytes:ix length:n * 24 options:MTLResourceStorageModeShared]; g_quad_gpu = g_quad_ib.gpuAddress; res_add(g_quad_ib); free(ix);
         }
-        if (dw->count >= 4) enc_r_draw_indexed(en, mp, (dw->count / 4) * 6, MTLIndexTypeUInt32, g_quad_gpu, g_quad_ib.length, 1, dw->first, 0);
+        if (dw->count >= 4) enc_r_draw_indexed(en, mp, (dw->count / 4) * 6, MTLIndexTypeUInt32, g_quad_gpu, g_quad_ib.length, 1, dw->first, 0, g_quad_ib, 0);
     } else if (dw) {
         if (dw->count) enc_r_draw(en, mp, dw->first, dw->count);
     } else {
@@ -4480,10 +4605,10 @@ frz_plain:;
         if (di->itype == 0) { RED_ONCE(21, "8 位索引未实现"); return; }
         void *mb; uint64_t mo;
         uint64_t gpu;
-        if (!mtl_gpu_addr(di->ibuf, 1, &mb, &mo, &gpu)) { RED_ONCE(22, "索引缓冲不在内存池里"); return; }
+        if (!mtl_gpu_addr(di->ibuf, di->count ? (uint64_t)di->count * (di->itype == 1 ? 2 : 4) : 1, &mb, &mo, &gpu)) { RED_ONCE(22, "索引缓冲不在内存池里"); return; }
         use_rec("buf", di->ibuf, (uint64_t)di->count * (di->itype == 1 ? 2 : 4), 0, NULL);
         if (di->count) enc_r_draw_indexed(en, mp, di->count, di->itype == 1 ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32, gpu, ((__bridge id<MTLBuffer>)mb).length - mo,
-                di->instances ? di->instances : 1, di->base_vertex, di->base_instance);
+                di->instances ? di->instances : 1, di->base_vertex, di->base_instance, (__bridge id<MTLBuffer>)mb, mo);
     }
     if (g_rt_range_pending) { PD("j rt_level_range pass=%llu vc=%u", g_stat_pass, (unsigned)(dw ? dw->count : di->count)); g_rt_range_pending=0; }
 }
@@ -4546,16 +4671,18 @@ static void bright_lut(NvShader *cs) {
     if (!lut || lut.textureType != MTLTextureType3D || !(lut.usage & MTLTextureUsageShaderWrite)) { static int n; if (!n++) MLOG("【红】3D 画面加亮：调色表认不出（贴图号 %d），不加亮", tid); return; }
     if (!ps) { NSError *e = nil; id<MTLLibrary> lib = [g_dev newLibraryWithSource:@(k_lut_msl) options:nil error:&e]; id<MTLFunction> f = lib ? [lib newFunctionWithName:@"lutk"] : nil;
         ps = f ? [g_dev newComputePipelineStateWithFunction:f error:&e] : nil;
-        MTL4ArgumentTableDescriptor *ad = [MTL4ArgumentTableDescriptor new]; ad.maxTextureBindCount = 2; ad.maxBufferBindCount = 1; at = [g_dev newArgumentTableWithDescriptor:ad error:&e];
+        MTL4ArgumentTableDescriptor *ad = [MTL4ArgumentTableDescriptor new]; ad.maxTextureBindCount = 2; ad.maxBufferBindCount = 1; if (g_m4) at = [g_dev newArgumentTableWithDescriptor:ad error:&e];
         for (int i = 0; i < 3; i++) { kb[i] = [g_dev newBufferWithLength:16 options:MTLResourceStorageModeShared]; if (kb[i]) res_add(kb[i]); }
-        if (!ps || !at || !kb[0] || !kb[1] || !kb[2]) { failed = 1; MLOG("【红】3D 画面加亮：计算管线建不出 %s（退回原版亮度）", e.localizedDescription.UTF8String); return; }
+        if (!ps || (g_m4 && !at) || !kb[0] || !kb[1] || !kb[2]) { failed = 1; MLOG("【红】3D 画面加亮：计算管线建不出 %s（退回原版亮度）", e.localizedDescription.UTF8String); return; }
         MLOG("3D 画面加亮：建好（调色表 %lux%lux%lu，曝光每帧由 dm_bright_k 给）", (unsigned long)lut.width, (unsigned long)lut.height, (unsigned long)lut.depth); }
     if (!tmp || tmp.width != lut.width || tmp.height != lut.height || tmp.depth != lut.depth || tmp.pixelFormat != lut.pixelFormat) {
         MTLTextureDescriptor *d = [MTLTextureDescriptor new]; d.textureType = MTLTextureType3D; d.pixelFormat = lut.pixelFormat; d.width = lut.width; d.height = lut.height; d.depth = lut.depth;
         d.usage = MTLTextureUsageShaderRead; d.storageMode = MTLStorageModePrivate; if (tmp) defer_obj_release(tmp); tmp = [g_dev newTextureWithDescriptor:d]; if (!tmp) { failed = 1; return; } res_add(tmp); }
     id<MTLBuffer> b0 = kb[ki]; ki = (ki + 1) % 3; *(float *)b0.contents = k;   // 三份轮换：在途的帧还在读上一份 | Three copies in rotation: in-flight frames are still reading the previous copy
     id<MTL4ComputeCommandEncoder> b = blit(); enc_b_copy_texture(b, lut, 0, 0, MTLOriginMake(0, 0, 0), MTLSizeMake(lut.width, lut.height, lut.depth), tmp, 0, 0, MTLOriginMake(0, 0, 0)); enc_b_end(g_blit); g_blit = nil;
-    id<MTL4ComputeCommandEncoder> ce = (id<MTL4ComputeCommandEncoder>)enc_c_begin(NULL); [ce setArgumentTable:at]; [at setTexture:tmp.gpuResourceID atIndex:0]; [at setTexture:lut.gpuResourceID atIndex:1]; [at setAddress:b0.gpuAddress atIndex:0];
+    id<MTL4ComputeCommandEncoder> ce = enc_c_begin(NULL);
+    if (g_m4) { [ce setArgumentTable:at]; [at setTexture:tmp.gpuResourceID atIndex:0]; [at setTexture:lut.gpuResourceID atIndex:1]; [at setAddress:b0.gpuAddress atIndex:0]; }
+    else { id<MTLComputeCommandEncoder> classic = (id)ce; [classic setTexture:tmp atIndex:0]; [classic setTexture:lut atIndex:1]; [classic setBuffer:b0 offset:0 atIndex:0]; }
     enc_c_pso(ce, ps); enc_c_dispatch(ce, MTLSizeMake((lut.width + 3) / 4, (lut.height + 3) / 4, (lut.depth + 3) / 4), MTLSizeMake(4, 4, 4)); enc_c_end(ce);
     args_dirty_all();
 }
@@ -4586,7 +4713,8 @@ static void dispatch(const p_dispatch *dp) {
         rp_end(); if (g_blit) { enc_b_end(g_blit); g_blit = nil; }
         id<MTLComputeCommandEncoder> ce = pg_compute();
         enc_c_pso(ce, ps);
-        enc_c_args(ce, ((__bridge id<MTLBuffer>)ub).gpuAddress + uo, 0); enc_c_args(ce, ((__bridge id<MTLBuffer>)sb).gpuAddress + so, 1); enc_c_args(ce, ((__bridge id<MTLBuffer>)db).gpuAddress + dof, 2);   // 内嵌计算核：冷路径，直接取地址 | Built-in compute kernel: cold path, take the addresses directly
+        if (!g_m4) { [ce setBuffer:(__bridge id<MTLBuffer>)ub offset:uo atIndex:0]; [ce setBuffer:(__bridge id<MTLBuffer>)sb offset:so atIndex:1]; [ce setBuffer:(__bridge id<MTLBuffer>)db offset:dof atIndex:2]; }   // 经典：对象直绑（内嵌计算核三槽固定） | Classic: bind the objects directly (the built-in kernel's three fixed slots)
+        else { enc_c_args(ce, ((__bridge id<MTLBuffer>)ub).gpuAddress + uo, 0); enc_c_args(ce, ((__bridge id<MTLBuffer>)sb).gpuAddress + so, 1); enc_c_args(ce, ((__bridge id<MTLBuffer>)db).gpuAddress + dof, 2); }   // 内嵌计算核：冷路径，直接取地址 | Built-in compute kernel: cold path, take the addresses directly
         enc_c_dispatch(ce, MTLSizeMake(dp->x, dp->y, dp->z), MTLSizeMake(32, 1, 1));
         enc_c_end(ce);
         return;
@@ -4701,8 +4829,8 @@ static int copy_t2t_astc(id<MTLTexture> s, id<MTLTexture> d, unsigned sl, unsign
     if (failed) return 0;
     if (!ps) { NSError *e = nil; id<MTLLibrary> lib = [g_dev newLibraryWithSource:@(k_a2u_msl) options:nil error:&e]; id<MTLFunction> f = lib ? [lib newFunctionWithName:@"a2u"] : nil;
         ps = f ? [g_dev newComputePipelineStateWithFunction:f error:&e] : nil;
-        MTL4ArgumentTableDescriptor *ad = [MTL4ArgumentTableDescriptor new]; ad.maxTextureBindCount = 2; ad.maxBufferBindCount = 1; at = [g_dev newArgumentTableWithDescriptor:ad error:&e];
-        if (!ps || !at) { failed = 1; MLOG("【红】无 BC：ASTC → 解压格式拷贝的计算管线建不出 %s", e.localizedDescription.UTF8String); return 0; } }
+        MTL4ArgumentTableDescriptor *ad = [MTL4ArgumentTableDescriptor new]; ad.maxTextureBindCount = 2; ad.maxBufferBindCount = 1; if (g_m4) at = [g_dev newArgumentTableWithDescriptor:ad error:&e];
+        if (!ps || (g_m4 && !at)) { failed = 1; MLOG("【红】无 BC：ASTC → 解压格式拷贝的计算管线建不出 %s", e.localizedDescription.UTF8String); return 0; } }
     MTLTextureType tt = MTLTextureType2D;
     id<MTLTexture> sv = [s newTextureViewWithPixelFormat:s.pixelFormat textureType:tt levels:NSMakeRange(sl, 1) slices:NSMakeRange(ss, 1)];
     id<MTLTexture> dv = [d newTextureViewWithPixelFormat:MTLPixelFormatRGBA8Unorm textureType:tt levels:NSMakeRange(dl, 1) slices:NSMakeRange(ds, 1)];
@@ -4711,8 +4839,9 @@ static int copy_t2t_astc(id<MTLTexture> s, id<MTLTexture> d, unsigned sl, unsign
     uint32_t *p = pb.contents; p[0] = sx; p[1] = sy; p[2] = dx; p[3] = dy; p[4] = w; p[5] = h; p[6] = s.pixelFormat == MTLPixelFormatASTC_4x4_sRGB; p[7] = 0;
     res_add(pb);
     rp_end(); if (g_blit) { enc_b_end(g_blit); g_blit = nil; }
-    id<MTL4ComputeCommandEncoder> ce = (id<MTL4ComputeCommandEncoder>)enc_c_begin(NULL); [ce setArgumentTable:at];
-    [at setTexture:sv.gpuResourceID atIndex:0]; [at setTexture:dv.gpuResourceID atIndex:1]; [at setAddress:pb.gpuAddress atIndex:0];
+    id<MTL4ComputeCommandEncoder> ce = enc_c_begin(NULL);
+    if (g_m4) { [ce setArgumentTable:at]; [at setTexture:sv.gpuResourceID atIndex:0]; [at setTexture:dv.gpuResourceID atIndex:1]; [at setAddress:pb.gpuAddress atIndex:0]; }
+    else { id<MTLComputeCommandEncoder> classic = (id)ce; [classic setTexture:sv atIndex:0]; [classic setTexture:dv atIndex:1]; [classic setBuffer:pb offset:0 atIndex:0]; }
     enc_c_pso(ce, ps); enc_c_dispatch(ce, MTLSizeMake((w + 7) / 8, (h + 7) / 8, 1), MTLSizeMake(8, 8, 1)); enc_c_end(ce);
     args_dirty_all();
     defer_obj_unref(sv); defer_obj_unref(dv); defer_obj_release(pb);   // 本次提交跑完再放（视图不单独驻留，参数块撤驻留） | Release after this submit has finished running (views are not made resident separately; the parameter block is removed from residency)
@@ -4793,7 +4922,7 @@ static void clear_tex(const p_clear_tex *c) {
     }
     rp_end(); if (g_blit) { enc_b_end(g_blit); g_blit = nil; }
     for (int z = 0; z < nz; z++) {
-        MTL4RenderPassDescriptor *rp = [MTL4RenderPassDescriptor new];
+        MTLRenderPassDescriptor *rp = g_m4 ? (MTLRenderPassDescriptor *)[MTL4RenderPassDescriptor new] : [MTLRenderPassDescriptor renderPassDescriptor];   // 经典走经典描述符（MTL4 描述符缺经典内部要读的字段） | Classic uses the classic descriptor (the MTL4 one lacks fields classic internals read)
         MTLRenderPassAttachmentDescriptor *a = depth ? rp.depthAttachment : stencil ? rp.stencilAttachment : rp.colorAttachments[0];
         a.texture = t; a.level = lv; a.loadAction = MTLLoadActionClear; a.storeAction = MTLStoreActionStore;
         if (is3d) a.depthPlane = c->r.zoffset + z; else a.slice = l0 + c->r.zoffset + z;
@@ -4802,7 +4931,7 @@ static void clear_tex(const p_clear_tex *c) {
                            rp.stencilAttachment.storeAction = MTLStoreActionStore; rp.stencilAttachment.clearStencil = c->c.u[1]; } }
         else if (stencil) rp.stencilAttachment.clearStencil = c->c.u[0];
         else rp.colorAttachments[0].clearColor = c->is_uint ? MTLClearColorMake(c->c.u[0], c->c.u[1], c->c.u[2], c->c.u[3]) : MTLClearColorMake(c->c.f[0], c->c.f[1], c->c.f[2], c->c.f[3]);
-        ser_gate(); enc_r_end(enc_r_begin(rp));
+        ser_gate(); enc_r_end(enc_r_begin((MTL4RenderPassDescriptor *)rp));
     }
 }
 
@@ -4889,7 +5018,7 @@ static int rt_want(void) {
 }
 static int rt_want_raw(void) { static int forced; if (g_rt.env < 0) { const char *e = getenv("DM_RT_AB"); g_rt.env = e ? atoi(e) : 0; forced = e != NULL; if (e) MLOG("DM_RT_AB=%d：画法由环境变量钉住（测试用，自定义页的开关不再起作用）", g_rt.env); }
     if (forced) g_dm_rt_ab = g_rt.env;
-    return g_dm_rt_ab == 1 && !g_rt.disabled && g_frz_on <= 0 && tbdr_on() && g_ruler_truth <= 0 && mtl_fps_target() == 60; }   // 面板开着世界冻结时让给冻结那条（更省）；省电模式（30 帧）每帧真画 | When a panel is open and the world is frozen, yield to the freeze path (saves more); power-saving mode (30 frames) really draws every frame
+    return g_m4 && g_dm_rt_ab == 1 && !g_rt.disabled && g_frz_on <= 0 && tbdr_on() && g_ruler_truth <= 0 && mtl_fps_target() == 60; }   // 面板开着世界冻结时让给冻结那条（更省）；省电模式（30 帧）每帧真画 | When a panel is open and the world is frozen, yield to the freeze path (saves more); power-saving mode (30 frames) really draws every frame
 #include "nvn_rtex.inc"
 static uint64_t rt_key(const p_set_rt *r) { uint64_t s_; int lv, sl; rt_sub(r, 8, &s_, &lv, &sl); return s_ * 64 + (uint64_t)lv * 8 + (uint64_t)sl; }
 static int rt_is_shadow(const p_set_rt *r) { return !r->n && r->depth && r->depth->d.width == r->depth->d.height; }
@@ -5026,7 +5155,7 @@ static int frz_op(unsigned op, const void *a) {   // 返回 1 = 这条操作不�
 
 void mtl_exec(const uint8_t *p) {
     static int inited; if (!inited) { inited = 1; state_reset(); }
-    if (!g_m4) { static int once; if (!once) { once = 1; MLOG("[P0] 经典后端：跳过命令重放（本阶段只验证经典队列初始化与出图）"); } (void)p; return; }   // P0：MTL4 编码路径整体不可用 | P0: the MTL4 encoding paths are unavailable as a whole
+    if (!g_m4) { static int once; if (!once) { once = 1; MLOG("[P2a] 经典后端：开始命令重放（绑定走逐槽 setter，IAB 用 sh->ae 重编码；上传与 ASTC 补充包路径仍关）"); } if (!g_dm_gate) return; }   // P2a：重放启用（up_/pkg_ 仍留待 P2b）；闸门 0 = 不重放 | P2a: replay enabled (up_/pkg_ still awaits P2b); gate 0 = no replay
     static int dump_all = -1; if (dump_all < 0) dump_all = getenv("DM_NVN_PASSDUMP_ALL") != NULL;
     int trace = dump_all && passdump();   // 普通模式不逐操作查帧范围，完整命令位置仅用于指定诊断帧 | Normal mode does not check the frame range per operation; the full command position is only used for the designated diagnostic frames
     for (;;) {
@@ -5560,20 +5689,9 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
         while (g_pq_done < g_present_alloc_fence[alloc_i]) pthread_cond_wait(&g_pq_cv, &g_pq_mu);
         pthread_mutex_unlock(&g_pq_mu);
     }
-    if (!g_m4) {   // P1 二分 A：清游戏交换链纹理（写附件）、不清 drawable、不画 blit——分离「写 src」与「画管线」两个嫌疑 | P1 bisect A: clear the game swapchain texture (attachment write) only -- separates the suspects "write src" vs "draw the pipeline"
+    if (!g_m4) {   // P2 经典出图：游戏绘制已通，换回真正的 blit（经典 present_encode 孪生：src → drawable，保宽高比） | P2 classic present: game draws work now, switch back to the real blit (the classic present_encode twin: src -> drawable, aspect ratio kept)
         id<MTLCommandBuffer> ccb = [g_q commandBuffer];
-        MTLRenderPassDescriptor *cp = [MTLRenderPassDescriptor renderPassDescriptor];
-        cp.colorAttachments[0].texture = src;
-        cp.colorAttachments[0].loadAction = MTLLoadActionClear;
-        cp.colorAttachments[0].clearColor = MTLClearColorMake(0.10, 0.18, 0.38, 1.0);
-        cp.colorAttachments[0].storeAction = MTLStoreActionStore;
-        id<MTLRenderCommandEncoder> cen = [ccb renderCommandEncoderWithDescriptor:cp]; [cen endEncoding];
-        MTLRenderPassDescriptor *dp2 = [MTLRenderPassDescriptor renderPassDescriptor];
-        dp2.colorAttachments[0].texture = dr.texture;
-        dp2.colorAttachments[0].loadAction = MTLLoadActionClear;
-        dp2.colorAttachments[0].clearColor = MTLClearColorMake(0.10, 0.18, 0.38, 1.0);
-        dp2.colorAttachments[0].storeAction = MTLStoreActionStore;
-        id<MTLRenderCommandEncoder> den2 = [ccb renderCommandEncoderWithDescriptor:dp2]; [den2 endEncoding];
+        if (!present_encode(ccb, src, dr.texture, crop)) { [ccb commit]; return 0; }
         uint64_t tick = ticket;
         [ccb addCompletedHandler:^(id<MTLCommandBuffer> c) {
             if (c.error) MLOG("【红】上屏命令缓冲错误：%s", c.error.description.UTF8String);

@@ -448,7 +448,14 @@ static _Atomic int g_cc_open;
 static _Atomic int g_fe_name_open, g_fe_name_tap;   // 起名页开着；点了输入框（重新弹键盘） | Naming page open; the input box was tapped (bring the keyboard up again)
 static const char *const k_cc_class[8] = { "Amazon", "Assassin", "Necromancer", "Barbarian", "Paladin", "Sorceress", "Warlock", "Druid" };
 static _Atomic int g_fe_opt_open, g_fe_confirm_open, g_fe_back;
+int dm_ui_character_create_open(void) {
+    return atomic_load(&g_cc_open) && !atomic_load(&g_fe_opt_open) && !atomic_load(&g_fe_name_open) && !atomic_load(&g_fe_confirm_open);
+}
+
 static _Atomic int g_fe_opt_side;   // 模式页最近一次点的是哪张牌：0 标准（左半屏）1 专家（右半屏） | Which card was tapped most recently on the mode page: 0 Standard (left half of the screen), 1 Hardcore (right half of the screen)
+int dm_ui_character_options_open(void) {
+    return atomic_load(&g_fe_opt_open) && !atomic_load(&g_fe_confirm_open);
+}
 // 「极乐世界」勾选项（布局见 touch_layout.py 的 _BLISS：模式页牌子下面一行，原版勾选框 TouchBliss + 标题 + 说明）。
 // 勾选框是原版开关按钮，点一下自己切换；点这一行的文字 = 点勾选框（点击挪到框心）。勾没勾读控件当前用的那组帧号：+0x6e8 = 当前常态帧，
 // 等于布局里写的 toggledFrame（4）即已勾（真机 逐字节比对：勾 / 不勾只有 +0x610、+0x6e8–0x6f7 这几处变）。模式页开着时每帧读一次记下来，页关了保留最后的值。
@@ -2577,6 +2584,11 @@ void dm_ui_mouse_pump(void) {   // 游戏取手柄处调（hle_hid fill，主线
 #include <dirent.h>
 #include <sys/stat.h>
 static _Atomic int g_fe_ribbon, g_fe_list, g_fe_name_key; static _Atomic int g_fe_skip_tut, g_fe_menu, g_fe_mode_modal, g_fe_options; static _Atomic int g_fe_name, g_fe_name_done; static _Atomic uint64_t g_fe_key_until, g_fe_key_mask;
+void dm_ui_character_option_choose(int hardcore) {
+    if (!dm_ui_character_options_open()) return;
+    atomic_store(&g_fe_opt_side, hardcore != 0);
+    atomic_store(&g_fe_options, 1);
+}
 static int has_character(const char *dir, int depth) {
     DIR *d = opendir(dir); if (!d) return 0; struct dirent *e; int found = 0;
     while (!found && (e = readdir(d))) { if (e->d_name[0] == '.') continue; char p[1024]; snprintf(p, sizeof p, "%s/%s", dir, e->d_name);
@@ -2596,6 +2608,9 @@ static void rs_on_uimsg(const char *cat, const char *act, const char *arg);   //
 // a changed system time, a fixed clock used by tests), the selected character does not sort to row 0 and someone else is entered. Here the name of the highlighted character is recorded at the moment of confirming, checked by name on the MainMenuHD:UpdateCharacterInfo that follows the re-sort,
 // and if it differs, set back with the original game's "set current character" main+0x7fe32c(index) and the refresh sent once more. The list / selected slot are paired by [main+0x2d7badc] (same as the one-tap restart section below); the character name is at record +0x10
 static char g_sel_name[17]; static uint64_t g_sel_fr;
+static _Atomic int g_character_play_available, g_character_play_request;
+int dm_ui_character_play_available(void) { return atomic_load(&g_character_play_available); }
+void dm_ui_character_play(void) { if (atomic_load(&g_character_play_available)) atomic_store(&g_character_play_request, 1); }
 static const char *sel_cur(uint8_t *b, const char *want, int64_t *at) {   // 当前选中角色的名字；want 非空时顺带在列表里找它的下标 | Name of the currently selected character; when want is non-empty, also find its index in the list
     int mode = *(int32_t *)(b + 0x2d7badc) != 1; uint8_t *lv = b + (mode ? 0x2d710f0 : 0x2d71108), *slot = b + (mode ? 0x2d7b950 : 0x2d7b960);
     uint64_t arr = *(uint64_t *)lv, n = *(uint64_t *)(lv + 8), cur = *(uint64_t *)slot; const char *nm = NULL; if (at) *at = -1;
@@ -2790,6 +2805,27 @@ void dm_ui_frontend_pump(void) {   // 取手柄处调；各动作之间隔开几
           for (char *t = strtok(buf, ";"); t && nd < 8; t = strtok(NULL, ";")) { unsigned long long f; ds[nd].g[0] = 0; if (sscanf(t, "%llu:%47[^:]:%47[^:]:%47s", &f, ds[nd].c, ds[nd].a, ds[nd].g) >= 3) { ds[nd].fr = f; nd++; } } } }
       uint64_t b = atomic_load(&g_taps_base), f0 = dm_guest_frame(); if (nd > 0 && b) for (int i = 0; i < nd; i++) if (!ds[i].done && f0 >= b + ds[i].fr) { ds[i].done = 1; if (ds[i].c[0] == '!') { void uimsg_emit(const char *, const char *, const char *); LOG("前端路径：只给订阅者补发 %s:%s %s（不进游戏）", ds[i].c + 1, ds[i].a, ds[i].g); uimsg_emit(ds[i].c + 1, ds[i].a, ds[i].g); } else fe_send(ds[i].c, ds[i].a, ds[i].g); } }   // 类别前加 ! = 只发给订阅者、不进游戏（造「消息上开着、游戏里没有」的现场用） | a ! before the category = sent only to subscribers, not into the game (for setting up the "open according to messages, absent in the game" scenario)
     rs_pump(); if (atomic_load(&g_rs) != RS_IDLE) return;   // 一键重开进行中：主菜单 / 选角页由它走，前端自动化不插手（不然主菜单上会按两次 X） | one-tap restart in progress: it handles the main menu / character select page and the front-end automation stays out (otherwise X would be pressed twice on the main menu)
+    static uint64_t play_guard;
+    uint64_t play_fr = dm_guest_frame();
+    module_t *play_m = main_module(); uint64_t play_root = 0;
+    if (play_m) memcpy(&play_root, play_m->base + 0x2f05458, 8);
+    uint64_t difficulty = play_root ? ui_panel(play_root, "CharacterDifficultyModal") : 0;
+    int can_play = play_m && atomic_load(&g_fe_ribbon) && !atomic_load(&g_cc_open)
+        && !atomic_load(&g_fe_opt_open) && !atomic_load(&g_fe_name_open)
+        && !atomic_load(&g_fe_confirm_open) && atomic_load(&g_load_up) != 1
+        && !(difficulty && *(uint8_t *)(difficulty + 0x50))
+        && sel_cur((uint8_t *)play_m->base, NULL, NULL);
+    atomic_store(&g_character_play_available, can_play && play_fr >= play_guard);
+    if (atomic_exchange(&g_character_play_request, 0) && can_play && play_fr >= play_guard) {
+        // The touch layout uses MainMenuHD's mouse/keyboard Play action.
+        // Controller A is ignored here; retain the highlighted save without re-sorting it.
+        play_guard = play_fr + 120;
+        atomic_store(&g_character_play_available, 0);
+        fe_send("MainMenuHD", "Play", "");
+        LOG("前端路径：开始游戏 → 原版 MainMenuHD:Play");
+        return;
+    }
+    if (play_fr < play_guard) return;
     static uint64_t next; uint64_t fr = dm_guest_frame(); if (fr < next) return;
     if (atomic_load(&g_cc_open)) {   // 职业选择页的「返回」只在有存档（从选角页进来）时出现；无存档时这页就是首页 | 「返回」(Back) on the class selection page appears only when there are saves (entered from the character select page); with no saves this page is the home page
         module_t *m = main_module(); uint64_t root = 0; if (m) memcpy(&root, m->base + 0x2f05458, 8);

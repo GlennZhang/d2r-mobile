@@ -141,6 +141,7 @@ int rt_ex_encode(id<MTLTexture> dst_hdr, id<MTLTexture> dst_ds, id<MTLTexture> s
     ((uint32_t *)k)[16] = unit_bits | ui_bits; k[17] = (float)amount;
     id<MTLBuffer> cbuf = g_rx_const[g_rx_ci]; g_rx_ci = (g_rx_ci + 1) % 3;
     rp_end(); if (g_blit) { enc_b_end(g_blit); g_blit = nil; }
+    if (!g_m4) return 0;   // P2a：外推通道整段是 MTL4（描述符 + 参数表 + rid）；经典后端跳过，回原画法 | P2a: the extrapolation pass is MTL4 throughout (descriptor + argument table + rid); the classic backend skips it and falls back to the original rendering
     // 单趟：外推 + 补洞 + 按小数相位补锐化 → dst_hdr；深度写进 dst_ds；本帧界面挡住的像素按模板跳过（模板不写）
     // Single pass: extrapolation + hole filling + sharpening compensation by fractional phase → dst_hdr; depth is written into dst_ds; pixels covered by this frame's UI are skipped by stencil (stencil not written)
     MTL4RenderPassDescriptor *rp = [MTL4RenderPassDescriptor new];

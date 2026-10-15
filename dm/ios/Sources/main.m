@@ -114,7 +114,7 @@ static void write_all(int fd, const char *p, size_t n) {
 // Not through devicectl: measured, devicectl --console delays the first line by about 76 s, and a killed session stalls the next command by about 80 s
 static pthread_mutex_t g_log_client_mu = PTHREAD_MUTEX_INITIALIZER;
 static int g_log_client = -1;
-static char g_log_path[1024];
+char g_log_path[1024];   // 非 static：gfx 层的远程调试闸门要从它推导 dm_gate.txt 的路径 | Not static: the gfx layer's remote debug gate derives its dm_gate.txt path from this
 static void log_client_write(const char *p, size_t n) {
     pthread_mutex_lock(&g_log_client_mu);
     if (g_log_client >= 0) {
@@ -976,6 +976,12 @@ static void bg_relaunch_test(void) {
 @end
 
 int main(int argc, char *argv[]) {
+    {   // 启动诊断标记：main() 一进来就落一个文件，用于分辨「进程没到 main」与「main 内死在哪一段」（写不进 Documents 时退回 /tmp）
+        NSString *dd = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES)[0];
+        FILE *mf = fopen([dd stringByAppendingPathComponent:@"dm_main_entered.txt"].fileSystemRepresentation, "w");
+        if (!mf) mf = fopen("/tmp/dm_main_entered.txt", "w");
+        if (mf) { fprintf(mf, "main entered\n"); fclose(mf); }
+    }
     g_T[2] = since_start();
     // 文件描述符上限：iOS 进程缺省软上限 256，而游戏进局后常开约 255 个（数据文件、存档、日志、Metal 缓存…），差一个就满——
     // 满了以后任何 open 都失败：存档读不出（首页变成建角页）、Documents 里的文件读不到（NSPOSIXErrorDomain 24 Too many open files）。
@@ -1035,6 +1041,15 @@ int main(int argc, char *argv[]) {
         metal_cache_report_and_clean();
         char why[2048];
         { id<MTLDevice> dev = MTLCreateSystemDefaultDevice(); g_no_bc = !dev.supportsBCTextureCompression || getenv("DM_TEST_NO_BC");
+          const char *low = getenv("DM_LOW_MEMORY");
+          BOOL low_memory = low ? atoi(low) != 0 : (NSProcessInfo.processInfo.physicalMemory <= (4ull << 30) && ![dev supportsFamily:MTLGPUFamilyApple7]);
+          if (low_memory) {
+              setenv("DM_LOW_MEMORY", "1", 1);
+              setenv("DM_3D_SCALE", "0.5", 0);
+              setenv("DM_GRANNY_PRE_MB", "32", 0);
+              setenv("DM_FPS", "30", 0);
+              plog("boot: 低内存模式：输出宽度上限 1280、3D 比例 %s、预解码缓存 %s MiB、帧率 %s", getenv("DM_3D_SCALE"), getenv("DM_GRANNY_PRE_MB"), getenv("DM_FPS"));
+          }
           plog("boot: 显卡 %s，BC 压缩格式%s", dev.name.UTF8String, g_no_bc ? (getenv("DM_TEST_NO_BC") ? "按测试开关 DM_TEST_NO_BC 当成不支持" : "不支持——不起游戏，弹框说明后退出") : "支持"); }
         if (g_no_bc) {   // 不支持 BC：有配套的老机型补充包就照常起（覆盖层换 ASTC 版，见 boot_prepare），没有就弹框 | BC not supported: if the matching Legacy Device Pack is present, start as usual (the overlay switches to the ASTC version, see boot_prepare); otherwise show an alert
             NSString *d = astc_pack_locate(g_astc_why, sizeof g_astc_why);
