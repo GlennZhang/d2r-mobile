@@ -1,5 +1,11 @@
 # D2R Mobile
 
+> **This branch: experimental iPhone 11 / A13 support (`mtl3-fallback`)**
+>
+> Character creation, loading existing saves and short play sessions have been tested on iPhone 11 (A13, 4 GB, iOS 26.3), using low-memory defaults and **30 fps**. Entry-time GPU timeouts, thermal pressure and high memory use remain; long-term stability is unverified. This does not establish support for other A13 / A12 models or all 4 GB devices.
+>
+> This branch has not been merged into upstream main. The upstream project introduction remains below; its “stable 60 fps” and one-second entry claims do not describe this branch's A13 results. See [iPhone 11 experimental support](docs/IPHONE11.md) for building, validation and known issues. **Bring your own game files and Legacy Device Pack.**
+
 **An open-source iOS / macOS compatibility layer for Diablo II: Resurrected with the Reign of the Warlock expansion.** It brings the Nintendo Switch release you bought, expansion included, to iPhone, iPad and Mac in full: the original game code runs natively, every control is rebuilt for touch, the frame rate holds at 60 fps, and you are in a game one second after the main menu. There is now a native macOS version as well (first version): on an Apple silicon Mac it starts on double-click and works with keyboard, mouse and gamepad. Apple TV 4K (3rd generation, A15) has a community port (developer preview) that has reached the character-selection screen only on its author's device; see the device table below.
 
 This is not a tech demo that "sort of runs". It is a mobile version polished for daily play, from your first character all the way through the endgame.
